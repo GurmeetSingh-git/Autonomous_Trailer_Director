@@ -3,10 +3,7 @@
   "logline": "A verified sequence of moments introduces the episode's people, stakes, and central question.",
   "spoiler_budget": 20,
   "characters": [
-    {
-      "name": "Primary subject",
-      "role": "Episode lead"
-    }
+    "Primary subject"
   ],
   "scenes": [
     {
@@ -15,12 +12,16 @@
       "timecode": "00:00:00",
       "start": 0.0,
       "end": 40.0,
+      "trailer_start": 0.0,
+      "trailer_end": 15.0,
       "description": "Introduces the episode subject and context.",
       "characters": [
         "Primary subject"
       ],
       "spoiler_level": "low",
-      "sensitive_content": []
+      "sensitive_content": [],
+      "emotion": "wonder",
+      "tone": "discovery"
     },
     {
       "id": "scene_02",
@@ -28,12 +29,16 @@
       "timecode": "00:00:40",
       "start": 40.0,
       "end": 84.0,
+      "trailer_start": 40.0,
+      "trailer_end": 55.0,
       "description": "Reveals a personal interest and a concrete point of view.",
       "characters": [
         "Primary subject"
       ],
       "spoiler_level": "medium",
-      "sensitive_content": []
+      "sensitive_content": [],
+      "emotion": "stakes",
+      "tone": "tension"
     },
     {
       "id": "scene_03",
@@ -46,7 +51,19 @@
         "Primary subject"
       ],
       "spoiler_level": "high",
-      "sensitive_content": []
+      "sensitive_content": [],
+      "emotion": "stakes",
+      "tone": "promise"
+    }
+  ],
+  "protected_facts": [
+    {
+      "id": "ending_choice",
+      "summary": "The final direction",
+      "keywords": [
+        "final direction"
+      ],
+      "first_revealed_in": "scene_03"
     }
   ],
   "source": "sample_run\\episode"

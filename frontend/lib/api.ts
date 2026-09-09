@@ -1,5 +1,4 @@
 export type Audience = "family" | "genre" | "prestige" | "action";
-export type GeminiModel = "gemini-3.5-flash-lite" | "gemini-3.6-flash";
 
 export type Scene = {
   id: string;
@@ -45,11 +44,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export async function uploadEpisode(file: File, audience: Audience, model: GeminiModel): Promise<{ runId: string }> {
+export async function uploadEpisode(file: File, audience: Audience): Promise<{ runId: string }> {
   const body = new FormData();
   body.append("episode", file);
   body.append("audience", audience);
-  body.append("model", model);
   const response = await fetch(`${API_URL}/runs`, { method: "POST", body });
   if (!response.ok) throw new Error(`Upload failed: ${response.status}`);
   return response.json() as Promise<{ runId: string }>;

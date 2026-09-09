@@ -2,15 +2,17 @@
   "trailer_id": "dialect_region_v1",
   "audience": "dialect_region",
   "objective": "Show cultural and linguistic familiarity without stereotyping.",
-  "duration_seconds": 84.0,
+  "duration_seconds": 30.0,
   "audience_promise": "Show cultural and linguistic familiarity without stereotyping. Ground the promise in the episode's verified characters and events.",
   "segments": [
     {
       "source_in": 0.0,
-      "source_out": 40.0,
+      "source_out": 15.0,
       "video": "scene_01",
       "audio": "original_dialogue",
       "subtitle": "source_subtitles",
+      "tone": "discovery",
+      "sensitive_content": [],
       "reason": "Introduces the episode subject and context. Supports the dialect_region promise.",
       "evidence": [
         "scene:scene_01",
@@ -19,15 +21,17 @@
       "risk_flags": [],
       "scene_id": "scene_01",
       "start": 0.0,
-      "end": 40.0,
+      "end": 15.0,
       "spoiler_level": "low"
     },
     {
       "source_in": 40.0,
-      "source_out": 84.0,
+      "source_out": 55.0,
       "video": "scene_02",
       "audio": "original_dialogue",
       "subtitle": "source_subtitles",
+      "tone": "tension",
+      "sensitive_content": [],
       "reason": "Reveals a personal interest and a concrete point of view. Supports the dialect_region promise.",
       "evidence": [
         "scene:scene_02",
@@ -36,7 +40,7 @@
       "risk_flags": [],
       "scene_id": "scene_02",
       "start": 40.0,
-      "end": 84.0,
+      "end": 55.0,
       "spoiler_level": "medium"
     }
   ],
@@ -46,31 +50,51 @@
     "checks": [
       {
         "name": "Existence and timing",
-        "status": "pass"
+        "status": "pass",
+        "severity": "pass",
+        "detail": "All scene references and time ranges are valid."
+      },
+      {
+        "name": "Spoiler",
+        "severity": "pass",
+        "status": "pass",
+        "detail": "No candidate segment matched any of 1 protected facts."
       },
       {
         "name": "Rights",
-        "status": "pass"
+        "severity": "warning",
+        "status": "warning",
+        "detail": "Contract clearance was not supplied; human approval is required."
       },
       {
         "name": "Rating",
-        "status": "pass"
+        "severity": "pass",
+        "status": "pass",
+        "detail": "Selected content meets the dialect_region audience policy."
       },
       {
         "name": "Accessibility",
-        "status": "pass"
+        "severity": "pass",
+        "status": "pass",
+        "detail": "Every selected segment has dialogue audio and subtitles."
       },
       {
         "name": "Bias",
-        "status": "pass"
+        "severity": "pass",
+        "status": "pass",
+        "detail": "No stereotyping language was detected in the selected evidence."
       },
       {
         "name": "Budget",
-        "status": "pass"
+        "severity": "pass",
+        "status": "pass",
+        "detail": "Estimated cost $0.02 is within the $1.00 budget."
       },
       {
         "name": "Prompt injection",
-        "status": "pass"
+        "severity": "pass",
+        "status": "pass",
+        "detail": "No prompt-injection instruction was detected in candidate content."
       }
     ]
   },

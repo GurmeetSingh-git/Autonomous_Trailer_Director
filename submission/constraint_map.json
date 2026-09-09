@@ -2,7 +2,7 @@
   "policies": [
     {
       "id": "no_major_spoilers",
-      "rule": "exclude high-risk scenes"
+      "rule": "exclude scenes matching protected_facts"
     },
     {
       "id": "source_accuracy",
@@ -19,6 +19,19 @@
       "scene_01",
       "scene_02",
       "scene_03"
-    ]
+    ],
+    "cleared_scene_ids": [],
+    "expired_assets": [],
+    "protected_facts": [
+      {
+        "id": "ending_choice",
+        "summary": "The final direction",
+        "keywords": [
+          "final direction"
+        ],
+        "first_revealed_in": "scene_03"
+      }
+    ],
+    "max_cost_usd": 1.0
   }
 }
