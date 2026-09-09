@@ -1,0 +1,53 @@
+{
+  "title": "Episode",
+  "logline": "A verified sequence of moments introduces the episode's people, stakes, and central question.",
+  "spoiler_budget": 20,
+  "characters": [
+    {
+      "name": "Primary subject",
+      "role": "Episode lead"
+    }
+  ],
+  "scenes": [
+    {
+      "id": "scene_01",
+      "title": "Introduction",
+      "timecode": "00:00:00",
+      "start": 0.0,
+      "end": 40.0,
+      "description": "Introduces the episode subject and context.",
+      "characters": [
+        "Primary subject"
+      ],
+      "spoiler_level": "low",
+      "sensitive_content": []
+    },
+    {
+      "id": "scene_02",
+      "title": "Personal perspective",
+      "timecode": "00:00:40",
+      "start": 40.0,
+      "end": 84.0,
+      "description": "Reveals a personal interest and a concrete point of view.",
+      "characters": [
+        "Primary subject"
+      ],
+      "spoiler_level": "medium",
+      "sensitive_content": []
+    },
+    {
+      "id": "scene_03",
+      "title": "Future direction",
+      "timecode": "00:01:24",
+      "start": 84.0,
+      "end": 125.0,
+      "description": "Closes with goals and a forward-looking invitation.",
+      "characters": [
+        "Primary subject"
+      ],
+      "spoiler_level": "high",
+      "sensitive_content": []
+    }
+  ],
+  "source": "sample_run\\episode"
+}

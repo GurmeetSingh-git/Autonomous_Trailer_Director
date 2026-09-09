@@ -1,0 +1,32 @@
+[
+  {
+    "decision": "plan_created",
+    "evidence": {
+      "audience": "family",
+      "segments": [
+        "scene_01",
+        "scene_02"
+      ]
+    }
+  },
+  {
+    "decision": "plan_created",
+    "evidence": {
+      "audience": "young_adult",
+      "segments": [
+        "scene_02",
+        "scene_01"
+      ]
+    }
+  },
+  {
+    "decision": "plan_created",
+    "evidence": {
+      "audience": "dialect_region",
+      "segments": [
+        "scene_01",
+        "scene_02"
+      ]
+    }
+  }
+]

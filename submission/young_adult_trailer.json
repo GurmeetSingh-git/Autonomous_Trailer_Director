@@ -1,0 +1,79 @@
+{
+  "trailer_id": "young_adult_v1",
+  "audience": "young_adult",
+  "objective": "Highlight pace, humour, identity, and character conflict.",
+  "duration_seconds": 84.0,
+  "audience_promise": "Highlight pace, humour, identity, and character conflict. Ground the promise in the episode's verified characters and events.",
+  "segments": [
+    {
+      "source_in": 40.0,
+      "source_out": 84.0,
+      "video": "scene_02",
+      "audio": "original_dialogue",
+      "subtitle": "source_subtitles",
+      "reason": "Reveals a personal interest and a concrete point of view. Supports the young_adult promise.",
+      "evidence": [
+        "scene:scene_02",
+        "policy:no_major_spoilers"
+      ],
+      "risk_flags": [],
+      "scene_id": "scene_02",
+      "start": 40.0,
+      "end": 84.0,
+      "spoiler_level": "medium"
+    },
+    {
+      "source_in": 0.0,
+      "source_out": 40.0,
+      "video": "scene_01",
+      "audio": "original_dialogue",
+      "subtitle": "source_subtitles",
+      "reason": "Introduces the episode subject and context. Supports the young_adult promise.",
+      "evidence": [
+        "scene:scene_01",
+        "policy:no_major_spoilers"
+      ],
+      "risk_flags": [],
+      "scene_id": "scene_01",
+      "start": 0.0,
+      "end": 40.0,
+      "spoiler_level": "low"
+    }
+  ],
+  "validation": {
+    "status": "PASS_WITH_WARNINGS",
+    "failures": [],
+    "checks": [
+      {
+        "name": "Existence and timing",
+        "status": "pass"
+      },
+      {
+        "name": "Rights",
+        "status": "pass"
+      },
+      {
+        "name": "Rating",
+        "status": "pass"
+      },
+      {
+        "name": "Accessibility",
+        "status": "pass"
+      },
+      {
+        "name": "Bias",
+        "status": "pass"
+      },
+      {
+        "name": "Budget",
+        "status": "pass"
+      },
+      {
+        "name": "Prompt injection",
+        "status": "pass"
+      }
+    ]
+  },
+  "estimated_cost_usd": 0.02,
+  "fallback_plan": "Use replay fixtures and deterministic checks if the preferred model is unavailable."
+}

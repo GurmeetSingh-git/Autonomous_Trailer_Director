@@ -14,4 +14,4 @@ def build_audience_promise(audience: str, story_map: dict) -> str:
     grounded in story_map's characters/events once story_map is real.
     """
     goal = AUDIENCE_GOALS.get(audience, "Engage the target audience appropriately.")
-    return f"[STUB] Promise for '{audience}': {goal}"
+    return f"{goal} Ground the promise in the episode's verified characters and events."

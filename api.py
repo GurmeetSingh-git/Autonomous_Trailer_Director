@@ -1,6 +1,7 @@
 """FastAPI entrypoint for the Autonomous Trailer Director frontend."""
 
 from copy import deepcopy
+import logging
 import os
 from pathlib import Path
 import shutil
@@ -15,6 +16,7 @@ from src.llm.client import LLMClient
 
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 
 app = FastAPI(title="Autonomous Trailer Director")
@@ -115,6 +117,7 @@ def health() -> dict[str, str]:
 async def create_run(
     episode: UploadFile = File(...),
     audience: str = Form("family"),
+    model: str = Form(""),
 ) -> dict[str, str]:
     run_id = str(uuid4())
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -122,6 +125,11 @@ async def create_run(
     video_path = UPLOAD_DIR / f"{run_id}_{safe_name}"
     with video_path.open("wb") as destination:
         shutil.copyfileobj(episode.file, destination)
+    logger.info("Saved uploaded episode %s (%d bytes)", safe_name, video_path.stat().st_size)
+    selected_model = model or os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    if not selected_model.startswith("gemini-"):
+        video_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Invalid Gemini model selection.")
 
     try:
         llm = LLMClient(mode="live")
@@ -131,9 +139,11 @@ async def create_run(
             context={"audience": audience, "filename": safe_name},
             response_schema=GeneratedStoryMap,
             cache_key=run_id,
+            model=selected_model,
         )
     except Exception as exc:
         video_path.unlink(missing_ok=True)
+        logger.exception("Episode analysis failed for run %s", run_id)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     story_map = {

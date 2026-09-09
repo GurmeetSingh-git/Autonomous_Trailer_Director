@@ -20,3 +20,10 @@ class EDL(BaseModel):
     title: str = ""
     clips: list[EDLClip] = Field(default_factory=list)
     duration: float = 0.0
+
+
+def build_edl(state: dict[str, Any]) -> dict[str, Any]:
+    """Convert validated graph segments into the shared EDL contract."""
+    clips = [EDLClip(scene_id=clip["scene_id"], start=clip["start"], end=clip["end"], metadata=clip) for clip in state.get("segments", [])]
+    edl = EDL(title=state.get("audience", "trailer"), clips=clips, duration=sum(clip.end - clip.start for clip in clips))
+    return edl.model_dump()

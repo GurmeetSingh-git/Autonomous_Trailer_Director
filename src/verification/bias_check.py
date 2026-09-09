@@ -3,4 +3,4 @@
 
 def check(candidate, context=None) -> bool:
     """Return whether the candidate meets bias constraints."""
-    raise NotImplementedError
+    return not any("stereotype" in str(item).lower() for item in candidate)

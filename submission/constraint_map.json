@@ -1,0 +1,24 @@
+{
+  "policies": [
+    {
+      "id": "no_major_spoilers",
+      "rule": "exclude high-risk scenes"
+    },
+    {
+      "id": "source_accuracy",
+      "rule": "scene ids and timecodes must exist"
+    },
+    {
+      "id": "audience_safety",
+      "rule": "exclude sensitive content for family"
+    }
+  ],
+  "contracts": [],
+  "metadata": {
+    "scene_ids": [
+      "scene_01",
+      "scene_02",
+      "scene_03"
+    ]
+  }
+}
