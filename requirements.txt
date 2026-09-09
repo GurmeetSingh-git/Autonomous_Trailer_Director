@@ -1,0 +1,6 @@
+google-genai
+pydantic
+python-dotenv
+opencv-python
+ffmpeg-python
+pytest
