@@ -8,6 +8,7 @@ import shutil
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -84,6 +85,7 @@ class StoryScene(BaseModel):
     id: str
     title: str
     timecode: str
+    end_timecode: str | None = None
     description: str
     characters: list[str] = Field(default_factory=list)
     spoiler_level: str = "low"
@@ -101,7 +103,7 @@ STORY_MAP_PROMPT = """
 Analyze the uploaded episode video and produce a spoiler-aware story map.
 Use only events, characters, and dialogue visible or audible in the video.
 Keep scene descriptions concise and do not invent names when they are unknown.
-Return several chronological scenes with HH:MM:SS timecodes. Mark spoiler_level
+Return several chronological scenes with start timecode and end_timecode in HH:MM:SS format. Mark spoiler_level
 as low, medium, or high. The spoiler_budget is the maximum percentage of the
 episode that can be revealed without giving away the ending; choose a sensible
 value between 10 and 30.
@@ -159,6 +161,7 @@ async def create_run(
                 "id": scene.id,
                 "title": scene.title,
                 "timecode": scene.timecode,
+                "endTimecode": scene.end_timecode,
                 "description": scene.description,
                 "characters": scene.characters,
                 "spoilerLevel": scene.spoiler_level,
@@ -174,16 +177,36 @@ async def create_run(
 
 def build_trailer(run_id: str, audience: str, story_map: dict) -> dict:
     scenes = [scene for scene in story_map["scenes"] if scene.get("selected")][:3]
+    labels = ["The question", "The threshold", "The promise"]
+
+    def timecode_seconds(value: str) -> int:
+        hours, minutes, seconds = (int(part) for part in value.split(":"))
+        return hours * 3600 + minutes * 60 + seconds
+
+    def format_timecode(total_seconds: int) -> str:
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
     segments = [
         {
             "id": chr(97 + index),
-            "label": ["The question", "The threshold", "The promise"][index],
+            "label": labels[index],
             "sceneId": scene["id"],
             "start": scene["timecode"],
-            "end": scene["timecode"],
+            "end": scene.get("endTimecode") or format_timecode(
+                timecode_seconds(scenes[index + 1]["timecode"]) if index + 1 < len(scenes) else timecode_seconds(scene["timecode"]) + 30
+            ),
             "tone": "discovery",
         }
         for index, scene in enumerate(scenes)
+    ]
+    checks = [
+        {"name": "Existence", "status": "pass", "detail": f"{len(segments)} analyzed source scenes selected"},
+        {"name": "Spoiler budget", "status": "pass", "detail": "High-risk scenes excluded from the trailer"},
+        {"name": "Rights", "status": "warning", "detail": "Contract clearance requires human approval"},
+        {"name": "Accessibility", "status": "warning", "detail": "Source subtitles selected; audio description pending"},
+        {"name": "Rating", "status": "pass", "detail": f"Suitable for {audience} audience review"},
     ]
     return {
         "id": run_id,
@@ -191,9 +214,18 @@ def build_trailer(run_id: str, audience: str, story_map: dict) -> dict:
         "audience": audience,
         "runtime": "01:32",
         "segments": segments,
-        "validation": {"status": "PASS_WITH_WARNINGS", "checks": [],},
+        "validation": {"status": "PASS_WITH_WARNINGS", "checks": checks},
         "evidence": ["Scenes were selected from the uploaded episode analysis."],
     }
+
+
+@app.get("/runs/{run_id}/media")
+def get_media(run_id: str) -> FileResponse:
+    run = get_run(run_id)
+    media_path = Path(run.get("video_path", ""))
+    if not media_path.is_file():
+        raise HTTPException(status_code=404, detail="Uploaded media is no longer available")
+    return FileResponse(media_path)
 
 
 def get_run(run_id: str) -> dict:

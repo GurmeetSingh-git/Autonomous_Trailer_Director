@@ -63,6 +63,10 @@ export function getTrailer(runId: string): Promise<TrailerRun> {
   return request<TrailerRun>(`/runs/${runId}/trailer`);
 }
 
+export function getMediaUrl(runId: string): string {
+  return `${API_URL}/runs/${runId}/media`;
+}
+
 export function startTrailerRun(runId: string): Promise<TrailerRun> {
   return request<TrailerRun>(`/runs/${runId}/plan`, { method: "POST" });
 }
