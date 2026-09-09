@@ -1,9 +1,12 @@
 # src/llm/client.py
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Type, TypeVar
 
+from google import genai
+from google.genai import types
 from pydantic import BaseModel
 
 T = TypeVar("T", bound=BaseModel)
@@ -34,9 +37,39 @@ class LLMClient:
         return response_schema.model_validate(data)
 
     def _call_live(self, system_prompt, media, context, response_schema: Type[T]) -> T:
-        # Wire up google-genai here. Raise clearly if GEMINI_API_KEY is missing
-        # rather than failing deep inside a genai call.
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
-            raise RuntimeError("GEMINI_API_KEY not set; use mode='replay' or set the key.")
-        raise NotImplementedError("Wire up google-genai call here")
+            raise RuntimeError("GEMINI_API_KEY not set; add it to .env before uploading a video.")
+        if not media:
+            raise ValueError("A video path is required for live media analysis.")
+
+        client = genai.Client(api_key=api_key)
+        uploaded = client.files.upload(file=media)
+        for _ in range(60):
+            state = getattr(uploaded, "state", None)
+            state_name = getattr(state, "name", state)
+            if state_name in (None, "ACTIVE"):
+                break
+            if state_name == "FAILED":
+                error = getattr(state, "error", None)
+                detail = getattr(error, "message", None) or str(error or "unknown processing error")
+                raise RuntimeError(f"Gemini could not process the uploaded video: {detail}")
+            time.sleep(2)
+            uploaded = client.files.get(name=uploaded.name)
+        else:
+            raise TimeoutError("Timed out while Gemini processed the uploaded video.")
+
+        prompt = f"{system_prompt}\n\nContext:\n{json.dumps(context, default=str)}"
+        response = client.models.generate_content(
+            model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+            contents=[uploaded, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=response_schema,
+            ),
+        )
+        if getattr(response, "parsed", None) is not None:
+            return response.parsed
+        if not response.text:
+            raise RuntimeError("Gemini returned an empty response.")
+        return response_schema.model_validate_json(response.text)
