@@ -1,10 +1,12 @@
 """FastAPI entrypoint for the Autonomous Trailer Director frontend."""
 
 from copy import deepcopy
+import json
 import logging
 import os
 from pathlib import Path
 import shutil
+import subprocess
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -18,6 +20,8 @@ from src.models.story_map import StoryMap
 from src.constraints.constraint_engine import ConstraintEngine
 from src.logging.decision_log import DecisionLog
 from src.orchestration.pipeline import AUDIENCES, build_plan
+from src.planning.audience_strategy import AUDIENCE_GOALS
+from src.verification.validator import Validator
 
 
 load_dotenv()
@@ -78,6 +82,44 @@ DEMO_TRAILER = {
 
 runs: dict[str, dict] = {}
 UPLOAD_DIR = Path("runtime/uploads")
+RENDER_DIR = Path("runtime/renders")
+RUNS_FILE = Path("runtime/runs.json")
+AUDIENCE_ARC_CACHE_VERSION = 4
+
+if RUNS_FILE.is_file():
+    try:
+        runs.update(json.loads(RUNS_FILE.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Could not restore saved run state from %s", RUNS_FILE)
+
+
+def save_runs() -> None:
+    RUNS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary_file = RUNS_FILE.with_suffix(".tmp")
+    temporary_file.write_text(json.dumps(runs), encoding="utf-8")
+    temporary_file.replace(RUNS_FILE)
+
+
+def planning_story_map(run: dict) -> dict:
+    """Return the normalized story map used by the audience planner."""
+    if "planning_story_map" in run:
+        return run["planning_story_map"]
+    story_map = run["story_map"]
+    return {
+        **story_map,
+        "spoiler_budget": story_map.get("spoilerBudget", 22),
+        "scenes": [
+            {
+                **scene,
+                "spoiler_level": scene.get("spoilerLevel", "low"),
+                "dialogue": True,
+                "trailer_start": scene.get("trailerStart", scene.get("start", 0)),
+                "trailer_end": scene.get("trailerEnd", scene.get("end", 0)),
+                "sensitive_content": scene.get("sensitiveContent", []),
+            }
+            for scene in story_map.get("scenes", [])
+        ],
+    }
 
 
 class StoryCharacter(BaseModel):
@@ -106,6 +148,33 @@ class GeneratedStoryMap(BaseModel):
     characters: list[StoryCharacter] = Field(default_factory=list)
     scenes: list[StoryScene] = Field(default_factory=list)
     spoiler_budget: int = 22
+
+
+class PromiseBeat(BaseModel):
+    scene_id: str
+    beat_name: str
+    source_in: str
+    source_out: str
+    emotional_goal: str
+    included: bool = True
+
+
+class PromiseArcUpdate(BaseModel):
+    audience: str = "family"
+    audience_profile: str = ""
+    audience_promise: str
+    narrative_arc: list[PromiseBeat]
+
+
+class AudienceCandidate(BaseModel):
+    scene_id: str
+    source_in: str
+    source_out: str
+    emotional_goal: str
+
+
+class AudienceCandidates(BaseModel):
+    candidates: list[AudienceCandidate] = Field(default_factory=list)
 
 
 STORY_MAP_PROMPT = """
@@ -203,11 +272,14 @@ async def create_run(
         "story_map": story_map,
         "trailer": trailer,
         "plans": plans,
+        "planning_story_map": internal_story_map,
+        "promise_arc": promise_arc_from_plan(plans[selected_audience]),
         "constraint_map": constraint_map,
         "decision_log": log.as_list(),
         "filename": safe_name,
         "video_path": str(video_path),
     }
+    save_runs()
     return {"runId": run_id}
 
 
@@ -220,6 +292,92 @@ def format_timecode(value: float) -> str:
     hours, remainder = divmod(value, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+
+
+def format_editable_timecode(value: float) -> str:
+    """Keep sub-second precision when a timecode will be submitted again."""
+    hours, remainder = divmod(value, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{int(hours):02d}:{int(minutes):02d}:{seconds:05.2f}"
+
+
+def reanalyze_audience_plan(run_id: str, run: dict, audience: str) -> dict:
+    """Ask the media model for fresh, audience-grounded source moments."""
+    story_map = planning_story_map(run)
+    model = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    context = {
+        "audience": audience,
+        "audience_goal": AUDIENCE_GOALS[audience],
+        "scenes": [{key: scene.get(key) for key in ("id", "start", "end", "description", "emotion", "tone", "characters", "spoiler_level")} for scene in story_map["scenes"]],
+    }
+    prompt = """
+Review the uploaded video again for the requested audience. Select up to three
+non-spoiler moments that best serve the audience goal. Return only moments
+that visibly or audibly occur in the video and inside the supplied scene
+boundaries. Use precise HH:MM:SS.ss timecodes. Prefer different moments when
+the audience goal calls for a different emphasis. Explain why each moment
+serves the audience in emotional_goal.
+"""
+    result = LLMClient(mode="live").generate_structured(
+        system_prompt=prompt,
+        media=run["video_path"],
+        context=context,
+        response_schema=AudienceCandidates,
+        cache_key=f"{run_id}-{audience}",
+        model=model,
+    )
+    scenes = {scene["id"]: scene for scene in story_map["scenes"]}
+    segments = []
+    for candidate in result.candidates[:3]:
+        scene = scenes.get(candidate.scene_id)
+        if not scene:
+            continue
+        start = parse_timecode(candidate.source_in)
+        end = parse_timecode(candidate.source_out)
+        if scene["spoiler_level"] == "high" or start < scene["start"] or end > scene["end"] or end <= start:
+            continue
+        segments.append({
+            "source_in": start, "source_out": end, "video": scene["id"], "audio": "original_dialogue",
+            "subtitle": "source_subtitles", "tone": scene.get("tone") or "discovery", "sensitive_content": scene.get("sensitive_content", []),
+            "reason": candidate.emotional_goal, "evidence": [f"scene:{scene['id']}", "human:audience_reanalysis"], "risk_flags": [],
+            "scene_id": scene["id"], "start": start, "end": end, "spoiler_level": scene["spoiler_level"],
+        })
+    if not segments:
+        raise ValueError("The model returned no valid audience-grounded moments.")
+    segments.sort(key=lambda item: item["start"])
+    validation = Validator().validate(segments, {
+        "scene_ids": run["constraint_map"].get("metadata", {}).get("scene_ids", []),
+        "cleared_scene_ids": run["constraint_map"].get("metadata", {}).get("cleared_scene_ids", []),
+        "expired_assets": run["constraint_map"].get("metadata", {}).get("expired_assets", []),
+        "protected_facts": run["constraint_map"].get("metadata", {}).get("protected_facts", []),
+        "audience": audience, "estimated_cost_usd": 0.02,
+        "max_cost_usd": run["constraint_map"].get("metadata", {}).get("max_cost_usd", 1.0),
+    })
+    plan = build_plan(audience, story_map, run["constraint_map"], DecisionLog())
+    plan.update({"segments": segments, "duration_seconds": sum(item["end"] - item["start"] for item in segments), "validation": validation})
+    return plan
+
+
+def promise_arc_from_plan(plan: dict) -> dict:
+    """Expose the intent that precedes clip selection in an editable form."""
+    beat_names = ("Introduction / Setup", "Conflict / Turning Point", "Resolution / Core Message")
+    return {
+        "audience": plan["audience"],
+        "audience_profile": plan["audience"],
+        "audience_promise": plan["audience_promise"],
+        "narrative_arc": [
+            {
+                "scene_id": segment["scene_id"],
+                "beat_name": beat_names[index] if index < len(beat_names) else f"Story beat {index + 1}",
+                "source_in": format_editable_timecode(segment["start"]),
+                "source_out": format_editable_timecode(segment["end"]),
+                "emotional_goal": segment["reason"],
+                "included": True,
+            }
+            for index, segment in enumerate(plan["segments"])
+        ],
+        "validation_status": plan["validation"]["status"],
+    }
 
 
 def media_duration(path: Path) -> float | None:
@@ -282,7 +440,7 @@ def trailer_from_plan(run_id: str, plan: dict, title: str) -> dict:
         "segments": [
             {
                 "id": chr(97 + index),
-                "label": segment["video"],
+                "label": segment.get("label", segment["video"]),
                 "sceneId": segment["scene_id"],
                 "start": format_timecode(segment["start"]),
                 "end": format_timecode(segment["end"]),
@@ -310,6 +468,72 @@ def get_media(run_id: str) -> FileResponse:
     return FileResponse(media_path)
 
 
+def render_segments(run_id: str, run: dict) -> Path:
+    """Slice the validated EDL and concatenate the clips into one video."""
+    media_path = Path(run.get("video_path", ""))
+    if not media_path.is_file():
+        raise HTTPException(status_code=404, detail="Uploaded media is no longer available")
+    segments = run.get("trailer", {}).get("segments", [])
+    if not segments:
+        raise HTTPException(status_code=422, detail="The validated timeline has no included clips")
+    RENDER_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = RENDER_DIR / f"{run_id}.mp4"
+    inputs = []
+    filters = []
+    for index, segment in enumerate(segments):
+        start = parse_timecode(segment["start"])
+        end = parse_timecode(segment["end"])
+        inputs.extend(["-ss", str(start), "-t", str(end - start), "-i", str(media_path)])
+        filters.append(f"[{index}:v]setpts=PTS-STARTPTS[v{index}]")
+        filters.append(f"[{index}:a]aresample=async=1:first_pts=0[a{index}]")
+    video_inputs = "".join(f"[v{index}][a{index}]" for index in range(len(segments)))
+    filters.append(f"{video_inputs}concat=n={len(segments)}:v=1:a=1[vout][aout]")
+    ffmpeg_executable = shutil.which("ffmpeg")
+    if not ffmpeg_executable:
+        winget_root = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
+        matches = list(winget_root.glob("Gyan.FFmpeg*/*/bin/ffmpeg.exe"))
+        ffmpeg_executable = str(matches[0]) if matches else "ffmpeg"
+    command = [ffmpeg_executable, "-y", *inputs, "-filter_complex", ";".join(filters), "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", str(output_path)]
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    except FileNotFoundError:
+        return render_segments_with_opencv(segments, media_path, output_path)
+    except subprocess.CalledProcessError as exc:
+        detail = "FFmpeg is required to render the final trailer."
+        if exc.stderr:
+            logger.error("Trailer render failed: %s", exc.stderr[-2000:])
+            detail = "The final trailer could not be rendered. Check the uploaded media and FFmpeg installation."
+        raise HTTPException(status_code=503, detail=detail) from exc
+    return output_path
+
+
+def render_segments_with_opencv(segments: list[dict], media_path: Path, output_path: Path) -> Path:
+    """Fallback renderer for local setups without an FFmpeg executable."""
+    try:
+        import cv2
+        capture = cv2.VideoCapture(str(media_path))
+        fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        if not capture.isOpened() or not writer.isOpened():
+            raise RuntimeError("Unable to open source or output video")
+        for segment in segments:
+            start_frame = max(0, int(parse_timecode(segment["start"]) * fps))
+            end_frame = max(start_frame, int(parse_timecode(segment["end"]) * fps))
+            capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            for _ in range(start_frame, end_frame):
+                success, frame = capture.read()
+                if not success:
+                    break
+                writer.write(frame)
+        capture.release()
+        writer.release()
+    except (ImportError, RuntimeError, OSError) as exc:
+        raise HTTPException(status_code=503, detail="The trailer could not be rendered with FFmpeg or OpenCV.") from exc
+    return output_path
+
+
 def get_run(run_id: str) -> dict:
     if run_id == "demo-run":
         return {"story_map": deepcopy(DEMO_STORY_MAP), "trailer": deepcopy(DEMO_TRAILER)}
@@ -329,6 +553,85 @@ def get_trailer(run_id: str) -> dict:
     return get_run(run_id)["trailer"]
 
 
+@app.get("/runs/{run_id}/promise-arc")
+def get_promise_arc(run_id: str, audience: str | None = None) -> dict:
+    run = get_run(run_id)
+    if audience:
+        if audience not in AUDIENCES:
+            raise HTTPException(status_code=400, detail="Unsupported audience.")
+        if run.get("audience_arc_cache_version") != AUDIENCE_ARC_CACHE_VERSION:
+            run["audience_arc_cache"] = {}
+            run["audience_arc_cache_version"] = AUDIENCE_ARC_CACHE_VERSION
+        arc_cache = run.setdefault("audience_arc_cache", {})
+        if audience in arc_cache:
+            return arc_cache[audience]
+        try:
+            plan = reanalyze_audience_plan(run_id, run, audience) if os.environ.get("GEMINI_API_KEY") else build_plan(audience, planning_story_map(run), run["constraint_map"], DecisionLog())
+        except Exception as exc:
+            logger.warning("Audience media re-analysis failed for %s/%s; using deterministic fallback: %s", run_id, audience, exc)
+            plan = build_plan(audience, planning_story_map(run), run["constraint_map"], DecisionLog())
+        run["plans"][audience] = plan
+        arc_cache[audience] = promise_arc_from_plan(plan)
+        save_runs()
+        return arc_cache[audience]
+    if "promise_arc" in run:
+        promise_arc = run["promise_arc"]
+        if "audience" in promise_arc:
+            return promise_arc
+    audience = run.get("trailer", {}).get("audience", "family")
+    return promise_arc_from_plan(run["plans"].get(audience, run["plans"]["family"]))
+
+
+@app.post("/runs/{run_id}/promise-arc")
+def update_promise_arc(run_id: str, update: PromiseArcUpdate) -> dict:
+    """Validate human intent edits, then regenerate the affected trailer plan."""
+    run = get_run(run_id)
+    if update.audience not in AUDIENCES:
+        raise HTTPException(status_code=400, detail="Unsupported audience.")
+    scenes = {scene["id"]: scene for scene in run["story_map"].get("scenes", [])}
+    segments = []
+    for beat in update.narrative_arc:
+        if not beat.included:
+            continue
+        scene = scenes.get(beat.scene_id)
+        if not scene:
+            raise HTTPException(status_code=422, detail=f"Unknown scene: {beat.scene_id}")
+        source_in = parse_timecode(beat.source_in)
+        source_out = parse_timecode(beat.source_out)
+        if source_in < scene["start"] or source_out > scene["end"] or source_out <= source_in:
+            raise HTTPException(status_code=422, detail=f"Invalid range for {beat.scene_id}; it must stay inside the source scene.")
+        segments.append({
+            "source_in": source_in, "source_out": source_out, "video": beat.scene_id,
+            "label": beat.beat_name,
+            "audio": "original_dialogue", "subtitle": "source_subtitles", "tone": scene.get("tone") or "discovery",
+            "sensitive_content": scene.get("sensitiveContent", scene.get("sensitive_content", [])),
+            "reason": beat.emotional_goal, "evidence": [f"scene:{beat.scene_id}", "human:promise_arc_edit"],
+            "risk_flags": [], "scene_id": beat.scene_id, "start": source_in, "end": source_out,
+            "spoiler_level": scene.get("spoilerLevel", scene.get("spoiler_level", "low")),
+        })
+    segments.sort(key=lambda item: item["start"])
+    if not segments:
+        raise HTTPException(status_code=422, detail="Include at least one narrative beat before regenerating the timeline.")
+    constraint_map = run["constraint_map"]
+    validation = Validator().validate(segments, {
+        "scene_ids": constraint_map.get("metadata", {}).get("scene_ids", []),
+        "cleared_scene_ids": constraint_map.get("metadata", {}).get("cleared_scene_ids", []),
+        "expired_assets": constraint_map.get("metadata", {}).get("expired_assets", []),
+        "protected_facts": constraint_map.get("metadata", {}).get("protected_facts", []),
+        "audience": update.audience, "estimated_cost_usd": 0.02,
+        "max_cost_usd": constraint_map.get("metadata", {}).get("max_cost_usd", 1.0),
+    })
+    plan = deepcopy(run["plans"].get(update.audience, run["plans"]["family"]))
+    plan.update({"audience": update.audience, "audience_promise": update.audience_promise, "segments": segments,
+                 "duration_seconds": sum(item["end"] - item["start"] for item in segments), "validation": validation})
+    run["plans"][update.audience] = plan
+    run["promise_arc"] = {**update.model_dump(), "validation_status": validation["status"]}
+    run.setdefault("audience_arc_cache", {})[update.audience] = run["promise_arc"]
+    run["trailer"] = trailer_from_plan(run_id, plan, run["story_map"]["title"])
+    save_runs()
+    return {"promise_arc": run["promise_arc"], "trailer": run["trailer"]}
+
+
 @app.get("/runs/{run_id}/plans")
 def get_plans(run_id: str) -> dict:
     run = get_run(run_id)
@@ -338,3 +641,17 @@ def get_plans(run_id: str) -> dict:
 @app.post("/runs/{run_id}/plan")
 def plan_trailer(run_id: str) -> dict:
     return get_run(run_id)["trailer"]
+
+
+@app.post("/runs/{run_id}/render")
+def render_trailer(run_id: str) -> dict:
+    output_path = render_segments(run_id, get_run(run_id))
+    return {"url": f"/runs/{run_id}/render", "filename": output_path.name}
+
+
+@app.get("/runs/{run_id}/render")
+def download_rendered_trailer(run_id: str) -> FileResponse:
+    output_path = RENDER_DIR / f"{run_id}.mp4"
+    if not output_path.is_file():
+        output_path = render_segments(run_id, get_run(run_id))
+    return FileResponse(output_path, media_type="video/mp4", filename=f"{run_id}-trailer.mp4")

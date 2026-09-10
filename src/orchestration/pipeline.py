@@ -8,11 +8,12 @@ from typing import Any
 from src.constraints.constraint_engine import ConstraintEngine
 from src.logging.decision_log import DecisionLog
 from src.models.story_map import StoryMap
-from src.planning.audience_strategy import AUDIENCE_GOALS, build_audience_promise
+from src.planning.audience_strategy import AUDIENCE_GOALS, audience_scene_score, build_audience_promise
 from src.verification.validator import Validator
 
 AUDIENCES = ("family", "young_adult", "dialect_region")
 EMOTION_PRIORITY = {"stakes": 4, "tension": 3, "joy": 2, "wonder": 2, "calm": 1}
+AUDIENCE_OFFSETS = {"family": (0.0, 0.0), "young_adult": (0.18, -0.08), "dialect_region": (0.08, 0.08)}
 
 
 def _edit_range(scene: dict[str, Any]) -> tuple[float, float]:
@@ -26,6 +27,16 @@ def _edit_range(scene: dict[str, Any]) -> tuple[float, float]:
             if end > start:
                 return start, end
     return scene_start, scene_end
+
+
+def _audience_edit_range(audience: str, scene: dict[str, Any]) -> tuple[float, float]:
+    """Choose a different emphasis window inside the verified scene range."""
+    start, end = _edit_range(scene)
+    duration = end - start
+    start_ratio, end_ratio = AUDIENCE_OFFSETS.get(audience, (0.0, 0.0))
+    adjusted_start = min(end - 0.5, start + duration * start_ratio)
+    adjusted_end = min(end, end + duration * end_ratio)
+    return adjusted_start, max(adjusted_start + 0.5, adjusted_end)
 
 
 def default_story_map(episode: Path) -> dict[str, Any]:
@@ -49,12 +60,13 @@ def build_plan(audience: str, story_map: dict[str, Any], constraint_map: dict[st
     """Build and validate one audience-specific trailer plan."""
     scenes = [scene for scene in story_map["scenes"] if scene.get("spoiler_level", "low") != "high"]
     if audience == "young_adult":
-        selected = sorted(scenes, key=lambda scene: EMOTION_PRIORITY.get(str(scene.get("emotion", "")).lower(), 0), reverse=True)
+        selected = sorted(scenes, key=lambda scene: (audience_scene_score(audience, scene), EMOTION_PRIORITY.get(str(scene.get("emotion", "")).lower(), 0)), reverse=True)
     elif audience == "dialect_region":
-        selected = [scene for scene in scenes if scene.get("dialogue", True)] or scenes
-        selected = sorted(selected, key=lambda scene: scene.get("start", 0))
+        dialogue_scenes = [scene for scene in scenes if scene.get("dialogue", True)] or scenes
+        selected = sorted(dialogue_scenes, key=lambda scene: audience_scene_score(audience, scene), reverse=True)
     else:
-        selected = sorted(scenes, key=lambda scene: scene.get("start", 0))
+        selected = sorted(scenes, key=lambda scene: audience_scene_score(audience, scene), reverse=True)
+    selected = sorted(selected[:3], key=lambda scene: scene.get("start", 0))
     segments = [
         {
             "source_in": edit_start,
@@ -73,7 +85,7 @@ def build_plan(audience: str, story_map: dict[str, Any], constraint_map: dict[st
             "spoiler_level": scene["spoiler_level"],
         }
         for scene in selected
-        for edit_start, edit_end in [_edit_range(scene)]
+        for edit_start, edit_end in [_audience_edit_range(audience, scene)]
     ]
     validation = Validator().validate(
     segments,

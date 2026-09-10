@@ -1,28 +1,36 @@
 "use client";
 
-import { Check, ChevronDown, TriangleAlert, X } from "lucide-react";
+import { Check, ChevronDown, Download, TriangleAlert, X } from "lucide-react";
 import { useSearchParams } from "next/navigation";
 import { useEffect, useState } from "react";
 import { ValidationBadge } from "@/components/ValidationBadge";
 import { SegmentList } from "@/components/SegmentList";
-import { demoTrailer, getMediaUrl, getTrailer, type TrailerRun } from "@/lib/api";
+import { demoTrailer, getMediaUrl, getRenderedTrailerUrl, getTrailer, renderTrailer, type TrailerRun } from "@/lib/api";
 
 export default function TrailersPage() {
   const searchParams = useSearchParams();
   const runId = searchParams.get("run");
   const [trailer, setTrailer] = useState<TrailerRun | null>(runId ? null : demoTrailer);
   const [error, setError] = useState("");
+  const [rendering, setRendering] = useState(Boolean(runId));
+  const [rendered, setRendered] = useState(false);
 
   useEffect(() => {
     if (!runId) return;
     let active = true;
     getTrailer(runId)
-      .then((run) => { if (active) setTrailer(run); })
-      .catch(() => { if (active) setError("This uploaded trailer run could not be loaded."); });
+      .then(async (run) => {
+        if (!active) return;
+        setTrailer(run);
+        await renderTrailer(runId);
+        if (active) { setRendered(true); setRendering(false); }
+      })
+      .catch((requestError) => { if (active) setError(requestError instanceof Error ? requestError.message : "This uploaded trailer run could not be loaded."); });
     return () => { active = false; };
   }, [runId]);
 
   if (error) return <main className="page"><div className="eyebrow">Trailer candidates / unavailable</div><h1>Run unavailable.</h1><p className="lede">{error}</p></main>;
   if (!trailer) return <main className="page"><div className="eyebrow">Trailer candidates / loading</div><h1>Shaping your trailer.</h1></main>;
-  return <main className="page"><div className="trailer-header"><div><div className="eyebrow">Trailer candidates / screen 03 + 04</div><h1>{trailer.title}</h1><p style={{ margin: 0 }}>Candidate A · {trailer.audience} audience promise · {trailer.runtime}</p></div><div className="status-stack"><ValidationBadge status={trailer.validation.status} /><p className="mono" style={{ margin: "10px 0 0" }}>VALIDATED 09 SEP 2026</p></div></div><div className="trailer-grid"><section className="panel"><div className="section-head"><div><div className="eyebrow">Edit decision list</div><h2>One clean arc.</h2></div><p>{trailer.runtime} total</p></div><div className="timeline"><SegmentList segments={trailer.segments} mediaUrl={runId ? getMediaUrl(runId) : undefined} /></div><button className="primary-button" style={{ marginTop: 25 }}>Export EDL <ChevronDown size={15} style={{ verticalAlign: "middle" }} /></button></section><aside><section className="panel"><div className="eyebrow">Independent checks</div><h2 style={{ marginTop: 12 }}>Proof of fit.</h2>{trailer.validation.checks.map((check) => { const Icon = check.status === "pass" ? Check : check.status === "warning" ? TriangleAlert : X; return <div className="check-row" key={check.name}><Icon size={15} className={`check-${check.status}`} /><div><strong>{check.name}</strong><span>{check.detail}</span></div></div>; })}</section><section className="panel" style={{ marginTop: 22 }}><div className="eyebrow">Decision evidence</div><h2 style={{ marginTop: 12 }}>Why this cut?</h2><ul className="evidence">{trailer.evidence.map((item) => <li key={item}>{item}</li>)}</ul></section></aside></div></main>;
+  const exportEdl = () => { const blob = new Blob([JSON.stringify(trailer.segments, null, 2)], { type: "application/json" }); const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = `${trailer.id}-edl.json`; link.click(); URL.revokeObjectURL(url); };
+  return <main className="page"><div className="trailer-header"><div><div className="eyebrow">Final render / screen 04</div><h1>{trailer.title}</h1><p style={{ margin: 0 }}>Validated trailer · {trailer.audience} audience promise · {trailer.runtime}</p></div><div className="status-stack"><ValidationBadge status={trailer.validation.status} /><p className="mono" style={{ margin: "10px 0 0" }}>{rendering ? "RENDERING FINAL CUT" : "FINAL CUT READY"}</p></div></div><div className="trailer-grid"><section className="panel"><div className="section-head"><div><div className="eyebrow">Final video preview</div><h2>{rendering ? "Compiling the selected beats." : "Preview the validated cut."}</h2></div><p>{trailer.runtime} total</p></div>{runId && <video className="preview-video" controls preload="metadata" src={rendered ? getRenderedTrailerUrl(runId) : undefined} />}{!runId && <p className="lede">Upload a real episode to render and preview the final video.</p>}<div className="timeline"><SegmentList segments={trailer.segments} mediaUrl={runId ? getMediaUrl(runId) : undefined} /></div><div style={{ display: "flex", gap: 10, marginTop: 25 }}><button className="primary-button" onClick={exportEdl}><Download size={15} style={{ verticalAlign: "middle" }} /> Export EDL</button>{runId && <a className="primary-button" href={rendered ? getRenderedTrailerUrl(runId) : undefined} download={`${trailer.id}-trailer.mp4`} style={{ textAlign: "center", opacity: rendered ? 1 : .5, pointerEvents: rendered ? "auto" : "none" }}>Download video</a>}</div></section><aside><section className="panel"><div className="eyebrow">Validation certificate</div><h2 style={{ marginTop: 12 }}>Proof of fit.</h2>{trailer.validation.checks.map((check, index) => { const Icon = check.status === "pass" ? Check : check.status === "warning" ? TriangleAlert : X; return <div className="check-row" key={`${check.name}-${index}`}><Icon size={15} className={`check-${check.status}`} /><div><strong>{check.name}</strong><span>{check.detail}</span></div></div>; })}</section><section className="panel" style={{ marginTop: 22 }}><div className="eyebrow">Decision evidence</div><h2 style={{ marginTop: 12 }}>Why this cut?</h2><ul className="evidence">{trailer.evidence.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}</ul></section></aside></div></main>;
 }

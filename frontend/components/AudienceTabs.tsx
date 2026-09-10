@@ -4,9 +4,8 @@ import type { Audience } from "@/lib/api";
 
 const audiences: { value: Audience; label: string; note: string }[] = [
   { value: "family", label: "Family", note: "Wonder first" },
-  { value: "genre", label: "Genre fans", note: "Lore and clues" },
-  { value: "prestige", label: "Prestige", note: "Character depth" },
-  { value: "action", label: "Action", note: "Momentum" },
+  { value: "young_adult", label: "Young adult", note: "Pace and identity" },
+  { value: "dialect_region", label: "Dialect / region", note: "Cultural familiarity" },
 ];
 
 export function AudienceTabs({ value, onChange }: { value: Audience; onChange: (value: Audience) => void }) {

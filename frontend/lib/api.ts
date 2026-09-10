@@ -1,4 +1,4 @@
-export type Audience = "family" | "genre" | "prestige" | "action";
+export type Audience = "family" | "young_adult" | "dialect_region";
 
 export type Scene = {
   id: string;
@@ -33,6 +33,23 @@ export type TrailerRun = {
   evidence: string[];
 };
 
+export type PromiseBeat = {
+  scene_id: string;
+  beat_name: string;
+  source_in: string;
+  source_out: string;
+  emotional_goal: string;
+  included: boolean;
+};
+
+export type PromiseArc = {
+  audience: string;
+  audience_profile: string;
+  audience_promise: string;
+  narrative_arc: PromiseBeat[];
+  validation_status: Validation["status"];
+};
+
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -40,7 +57,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: { "Content-Type": "application/json", ...init?.headers },
   });
-  if (!response.ok) throw new Error(`API request failed: ${response.status}`);
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const body = await response.json() as { detail?: string };
+      detail = body.detail ? `: ${body.detail}` : "";
+    } catch {
+      // Keep the status error when the response is not JSON.
+    }
+    throw new Error(`API request failed: ${response.status}${detail}`);
+  }
   return response.json() as Promise<T>;
 }
 
@@ -63,6 +89,26 @@ export function getTrailer(runId: string): Promise<TrailerRun> {
 
 export function getMediaUrl(runId: string): string {
   return `${API_URL}/runs/${runId}/media`;
+}
+
+export function getRenderedTrailerUrl(runId: string): string {
+  return `${API_URL}/runs/${runId}/render?t=${Date.now()}`;
+}
+
+export function renderTrailer(runId: string): Promise<{ url: string; filename: string }> {
+  return request<{ url: string; filename: string }>(`/runs/${runId}/render`, { method: "POST" });
+}
+
+export function getPromiseArc(runId: string, audience?: Audience): Promise<PromiseArc> {
+  const query = audience ? `?audience=${encodeURIComponent(audience)}` : "";
+  return request<PromiseArc>(`/runs/${runId}/promise-arc${query}`);
+}
+
+export function updatePromiseArc(runId: string, arc: PromiseArc): Promise<{ promise_arc: PromiseArc; trailer: TrailerRun }> {
+  return request<{ promise_arc: PromiseArc; trailer: TrailerRun }>(`/runs/${runId}/promise-arc`, {
+    method: "POST",
+    body: JSON.stringify(arc),
+  });
 }
 
 export function startTrailerRun(runId: string): Promise<TrailerRun> {
