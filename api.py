@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -540,6 +541,7 @@ def trailer_from_plan(run_id: str, plan: dict, title: str) -> dict:
 @app.get("/runs/{run_id}/media")
 def get_media(run_id: str) -> FileResponse:
     """Ask the model to revise the plot from the director's feedback."""
+    run = get_run(run_id)
     media_path = Path(run.get("video_path", ""))
     if not media_path.is_file():
         raise HTTPException(status_code=404, detail="Uploaded media is no longer available")
@@ -573,6 +575,58 @@ def render_segments_with_opencv(segments: list[dict], media_path: Path, output_p
     return output_path
 
 
+def render_segments_with_ffmpeg(segments: list[dict], media_path: Path, output_path: Path) -> Path:
+    """Cut and concatenate source ranges while preserving the audio track."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise FileNotFoundError("FFmpeg is not installed")
+    with tempfile.TemporaryDirectory(prefix="trailer-render-") as temporary_dir:
+        temporary_path = Path(temporary_dir)
+        clip_paths = []
+        for index, segment in enumerate(segments):
+            clip_path = temporary_path / f"clip-{index}.mp4"
+            subprocess.run(
+                [
+                    ffmpeg, "-y", "-ss", str(segment["start"]), "-to", str(segment["end"]),
+                    "-i", str(media_path), "-map", "0:v:0", "-map", "0:a?",
+                    "-c:v", "libx264", "-c:a", "aac", "-ar", "48000", "-avoid_negative_ts", "make_zero",
+                    str(clip_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            clip_paths.append(clip_path)
+        concat_list = temporary_path / "concat.txt"
+        concat_list.write_text("\n".join(f"file '{path.as_posix()}'" for path in clip_paths), encoding="utf-8")
+        subprocess.run(
+            [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", str(output_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    return output_path
+
+
+def render_segments(run_id: str, run: dict) -> Path:
+    """Render the selected trailer segments into the run's output file."""
+    media_path = Path(run.get("video_path", ""))
+    if not media_path.is_file():
+        raise HTTPException(status_code=404, detail="Uploaded media is no longer available")
+    RENDER_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = RENDER_DIR / f"{run_id}.mp4"
+    segments = run.get("trailer", {}).get("segments", [])
+    if not segments:
+        raise HTTPException(status_code=422, detail="The trailer has no renderable segments.")
+    if shutil.which("ffmpeg"):
+        try:
+            return render_segments_with_ffmpeg(segments, media_path, output_path)
+        except subprocess.CalledProcessError as exc:
+            detail = exc.stderr.strip().splitlines()[-1] if exc.stderr else "FFmpeg could not render the trailer."
+            raise HTTPException(status_code=503, detail=detail) from exc
+    return render_segments_with_opencv(segments, media_path, output_path)
+
+
 def get_run(run_id: str) -> dict:
     if run_id == "demo-run":
         return {"story_map": deepcopy(DEMO_STORY_MAP), "trailer": deepcopy(DEMO_TRAILER)}
@@ -594,31 +648,69 @@ def get_trailer(run_id: str) -> dict:
 
 @app.post("/runs/{run_id}/plot/reprocess")
 def reprocess_plot(run_id: str, request: PlotReprocessRequest, audience: str = "family") -> dict:
-    """Discard the cached plot and generate a fresh audience-specific proposal."""
+    """Use the director's prompt as revision instructions and regenerate the audience plan."""
     run = get_run(run_id)
     if run_id == "demo-run" or audience not in AUDIENCES:
         raise HTTPException(status_code=400, detail="A real run and supported audience are required.")
     run.setdefault("audience_arc_cache", {}).pop(audience, None)
     feedback = request.feedback.strip()
-    requests_more_beats = any(phrase in feedback.lower() for phrase in ("one more beat", "another beat", "additional beat", "more beats", "more beat"))
     feedback_lower = feedback.lower()
     remove_match = re.search(r"remove\s+(?:the\s+)?(?:(\d+)(?:st|nd|rd|th)?|first|second|third|last)\s+beat", feedback_lower)
+
     try:
-        if remove_match and run.get("plans", {}).get(audience):
-            plan = deepcopy(run["plans"][audience])
+        if os.environ.get("GEMINI_API_KEY"):
+            current_plan = run.get("plans", {}).get(audience) or build_plan(audience, planning_story_map(run), run["constraint_map"], DecisionLog())
+            scenes = planning_story_map(run).get("scenes", [])
+            prompt = """
+Revise the proposed trailer plot using the director's feedback as explicit instructions.
+Decide what to add, remove, reorder, rename, or rewrite.
+Follow the feedback exactly, even if it changes the number of story beats.
+Do not assume a rigid 3-beat limit; if the feedback asks for more or fewer beats,
+make the plan match that direction while keeping the best beats that still serve
+_the audience promise_. Use only the supplied scene IDs and exclude high-spoiler scenes.
+Preserve useful beats when the feedback does not explicitly ask to remove them.
+Return only story beats, not clip timecodes or editing instructions.
+"""
+            revision = LLMClient(mode="live").generate_structured(
+                system_prompt=prompt,
+                media=run["video_path"],
+                context={
+                    "audience": audience,
+                    "director_feedback": feedback,
+                    "current_plot": [{"scene_id": segment["scene_id"], "beat_name": segment.get("label", ""), "emotional_goal": segment.get("reason", "")} for segment in current_plan.get("segments", [])],
+                    "available_scenes": [{"id": scene["id"], "title": scene.get("title", ""), "description": scene.get("description", ""), "spoiler_level": scene.get("spoiler_level", "low")} for scene in scenes],
+                },
+                response_schema=PlotRevision,
+                cache_key=f"{run_id}-plot-revision-{len(feedback)}",
+                model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+            )
+            scene_by_id = {scene["id"]: scene for scene in scenes}
+            segments = []
+            for proposal in revision.beats:
+                scene = scene_by_id.get(proposal.scene_id)
+                if not scene or not proposal.included or scene.get("spoiler_level") == "high":
+                    continue
+                start = float(scene.get("trailer_start", scene.get("start", 0)))
+                end = float(scene.get("trailer_end", scene.get("end", start + 15)))
+                segments.append({
+                    "source_in": start, "source_out": end, "video": scene["id"],
+                    "label": proposal.beat_name, "audio": "original_dialogue", "subtitle": "source_subtitles",
+                    "tone": scene.get("tone") or scene.get("emotion") or "discovery", "sensitive_content": scene.get("sensitive_content", []),
+                    "reason": proposal.emotional_goal, "evidence": [f"scene:{scene['id']}", "human:plot_feedback", "llm:plot_revision"],
+                    "risk_flags": [], "scene_id": scene["id"], "start": start, "end": end,
+                    "spoiler_level": scene.get("spoiler_level", "low"),
+                })
+            if segments:
+                plan = deepcopy(current_plan)
+                plan.update({"audience_promise": revision.audience_promise, "segments": segments, "duration_seconds": sum(item["end"] - item["start"] for item in segments)})
+            else:
+                plan = build_plan(audience, planning_story_map(run), run["constraint_map"], DecisionLog())
         else:
-            plan = build_plan(audience, planning_story_map(run), run["constraint_map"], DecisionLog()) if (requests_more_beats or not os.environ.get("GEMINI_API_KEY")) else reanalyze_audience_plan(run_id, run, audience)
+            plan = build_plan(audience, planning_story_map(run), run["constraint_map"], DecisionLog())
     except Exception as exc:
         logger.warning("Plot reprocessing failed for %s/%s: %s", run_id, audience, exc)
         raise HTTPException(status_code=502, detail="The plot could not be reprocessed.") from exc
-    if requests_more_beats and len(plan.get("segments", [])) < 3:
-        deterministic_plan = build_plan(audience, planning_story_map(run), run["constraint_map"], DecisionLog())
-        existing_scene_ids = {segment.get("scene_id") for segment in plan.get("segments", [])}
-        additions = [segment for segment in deterministic_plan["segments"] if segment.get("scene_id") not in existing_scene_ids]
-        plan["segments"].extend(additions[: 3 - len(plan["segments"])])
-        plan["segments"].sort(key=lambda segment: segment.get("start", 0))
-        plan["duration_seconds"] = sum(segment["end"] - segment["start"] for segment in plan["segments"])
-        plan["validation"] = deterministic_plan["validation"]
+
     if remove_match and plan.get("segments"):
         requested = remove_match.group(1)
         if "last" in remove_match.group(0):
@@ -642,6 +734,18 @@ def reprocess_plot(run_id: str, request: PlotReprocessRequest, audience: str = "
                 "audience": audience, "estimated_cost_usd": 0.02,
                 "max_cost_usd": run["constraint_map"].get("metadata", {}).get("max_cost_usd", 1.0),
             })
+    if not plan.get("validation"):
+        metadata = run["constraint_map"].get("metadata", {})
+        plan["validation"] = Validator().validate(plan["segments"], {
+            "scene_ids": metadata.get("scene_ids", []),
+            "cleared_scene_ids": metadata.get("cleared_scene_ids", []),
+            "expired_assets": metadata.get("expired_assets", []),
+            "protected_facts": metadata.get("protected_facts", []),
+            "audience": audience,
+            "estimated_cost_usd": 0.02,
+            "max_cost_usd": metadata.get("max_cost_usd", 1.0),
+        })
+
     plot = promise_arc_from_plan(plan, feedback)
     run["plans"][audience] = plan
     run.setdefault("audience_arc_cache", {})[audience] = plot

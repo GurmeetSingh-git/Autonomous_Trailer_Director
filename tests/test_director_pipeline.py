@@ -156,3 +156,78 @@ def test_plot_reprocess_removes_requested_beat() -> None:
     )
 
     assert len(result["narrative_arc"]) == 2
+
+
+def test_plot_reprocess_forwards_freeform_feedback_to_llm(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import api
+    from api import PlotReprocessRequest, reprocess_plot
+
+    run = {
+        "story_map": {
+            "title": "Episode",
+            "scenes": [{
+                "id": "scene_01",
+                "title": "Opening",
+                "description": "Intro scene",
+                "start": 0,
+                "end": 30,
+                "spoilerLevel": "low",
+                "tone": "warm",
+                "emotion": "wonder",
+                "characters": ["Hero"],
+                "trailerStart": 0,
+                "trailerEnd": 15,
+            }],
+        },
+        "trailer": {"audience": "family", "segments": []},
+        "plans": {"family": {
+            "audience": "family",
+            "audience_promise": "Warm family story",
+            "segments": [{
+                "scene_id": "scene_01",
+                "start": 0,
+                "end": 15,
+                "source_in": 0,
+                "source_out": 15,
+                "reason": "Establishes the scene",
+                "evidence": ["scene:scene_01"],
+                "spoiler_level": "low",
+                "label": "Opening beat",
+                "video": "scene_01",
+            }],
+            "duration_seconds": 15,
+            "validation": {"status": "PASS", "checks": []},
+        }},
+        "constraint_map": {"metadata": {"scene_ids": ["scene_01"], "cleared_scene_ids": [], "expired_assets": [], "protected_facts": [], "max_cost_usd": 1.0}},
+    }
+    api.runs["llm-feedback-run"] = run
+
+    captured = {}
+
+    def fake_generate_structured(*args, **kwargs):
+        captured["feedback"] = kwargs["context"]["director_feedback"]
+        return SimpleNamespace(
+            audience_promise="A warmer family promise",
+            beats=[
+                SimpleNamespace(
+                    scene_id="scene_01",
+                    beat_name="Opening with warmth",
+                    emotional_goal="Establishes the family warmth.",
+                    included=True,
+                )
+            ],
+        )
+
+    monkeypatch.setattr(api.os, "environ", {"GEMINI_API_KEY": "test-key"})
+    monkeypatch.setattr(api.LLMClient, "generate_structured", fake_generate_structured)
+
+    result = reprocess_plot(
+        "llm-feedback-run",
+        PlotReprocessRequest(feedback="Add one more beat and make the story more playful."),
+        "family",
+    )
+
+    assert captured["feedback"] == "Add one more beat and make the story more playful."
+    assert result["audience_promise"] == "A warmer family promise"

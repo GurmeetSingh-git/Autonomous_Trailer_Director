@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { ArrowRight, Check, CircleAlert, Save } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { AudienceTabs } from "@/components/AudienceTabs";
 import { getPromiseArc, type Audience, type PromiseArc, updatePromiseArc } from "@/lib/api";
 const audiencePromises: Record<Audience, string> = {
@@ -12,7 +12,7 @@ const audiencePromises: Record<Audience, string> = {
   dialect_region: "Show cultural and linguistic familiarity without stereotyping.",
 };
 
-export default function PromiseArcPage() {
+function PromiseArcPage() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const runId = searchParams.get("run");
@@ -83,4 +83,8 @@ export default function PromiseArcPage() {
   if (!arc) return <main className="page"><div className="eyebrow">Promise & arc / loading</div><h1>Committing to the audience.</h1></main>;
 
     return <main className="page"><div className="section-head"><div><div className="eyebrow">Promise & arc / screen 03</div><h1 style={{ fontSize: 54, marginBottom: 0 }}>Audience before footage.</h1></div><span className="validation-badge badge-pass"><Check size={13} /> {arc.validation_status}</span></div><p className="lede">Review the intent before the timeline is finalized. Edit beats and choose which promises to include, then regenerate once.</p><section className="panel promise-panel"><label className="upload-label">Audience lens</label><AudienceTabs value={arc.audience as Audience} onChange={changeAudience} /><label className="upload-label" htmlFor="audience-profile">Audience profile</label><input id="audience-profile" className="arc-input" value={arc.audience_profile} onChange={(event) => setArc({ ...arc, audience_profile: event.target.value })} /><label className="upload-label" htmlFor="audience-promise">Audience promise</label><textarea id="audience-promise" className="arc-textarea promise-copy" value={arc.audience_promise} onChange={(event) => { setArc({ ...arc, audience_promise: event.target.value }); setSaved(false); }} /><button className="audience-regenerate" type="button" onClick={regenerateAudience} disabled={saving}>{saving ? "Generating timestamps..." : "Regenerate audience timestamps"}</button></section><section className="arc-list"><div className="section-head"><div><div className="eyebrow">Narrative arc</div><h2>Map the emotional journey.</h2></div><span className="mono">{arc.narrative_arc.filter((beat) => beat.included).length} of {arc.narrative_arc.length} included</span></div>{arc.narrative_arc.map((beat, index) => <article className={`panel arc-card${beat.included ? "" : " arc-card-excluded"}`} key={`${beat.scene_id}-${index}`}><div className="arc-card-head"><label className="arc-include"><input type="checkbox" checked={beat.included} onChange={(event) => updateBeat(index, "included", event.target.checked)} /> Include</label><span className="segment-index">0{index + 1}</span><input className="arc-input beat-name" value={beat.beat_name} onChange={(event) => updateBeat(index, "beat_name", event.target.value)} /><span className="mono">{beat.scene_id}</span></div><div className="arc-times"><label>Source in<input className="arc-input" value={beat.source_in} onChange={(event) => updateBeat(index, "source_in", event.target.value)} /></label><label>Source out<input className="arc-input" value={beat.source_out} onChange={(event) => updateBeat(index, "source_out", event.target.value)} /></label></div><label className="upload-label">Emotional goal<textarea className="arc-textarea" value={beat.emotional_goal} onChange={(event) => updateBeat(index, "emotional_goal", event.target.value)} /></label></article>)}</section>{error && <p className="arc-error"><CircleAlert size={14} /> {error}</p>}<div className="arc-actions"><Link className="mono" href={`/story-map?run=${runId}`}>Back to story map</Link><button className="primary-button arc-submit" onClick={regenerateTimeline} disabled={saving}><Save size={15} /> {saving ? "Validating arc..." : "Regenerate validated timeline"} <ArrowRight size={15} /></button></div>{saved && <p className="arc-success">Arc saved and validated.</p>}</main>;
+}
+
+export default function PromiseArcRoute() {
+  return <Suspense fallback={<main className="page"><h1>Committing to the audience.</h1></main>}><PromiseArcPage /></Suspense>;
 }

@@ -2,11 +2,11 @@
 
 import { Check, RefreshCw, TriangleAlert, X } from "lucide-react";
 import { useSearchParams } from "next/navigation";
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { ValidationBadge } from "@/components/ValidationBadge";
 import { getRenderedTrailerUrl, getTrailer, reviewTrailer, type TrailerRun } from "@/lib/api";
 
-export default function ReviewPage() {
+function ReviewPage() {
   const searchParams = useSearchParams();
   const runId = searchParams.get("run");
   const [trailer, setTrailer] = useState<TrailerRun | null>(null);
@@ -37,4 +37,8 @@ export default function ReviewPage() {
   if (!trailer) return <main className="page"><div className="eyebrow">Director review</div><h1>Review unavailable.</h1><p className="lede">{message}</p></main>;
 
   return <main className="page"><div className="review-header"><div><div className="eyebrow">Director review / human checkpoint</div><h1>{trailer.title}</h1><p className="lede">Review the suggested trailer plot, inspect the cut, and approve or send focused notes back to the director.</p></div><ValidationBadge status={trailer.validation.status} /></div><div className="review-grid"><section><video className="review-video" controls preload="metadata" src={getRenderedTrailerUrl(runId)} /><div className="review-plot panel"><div className="eyebrow">Suggested trailer plot</div><h2>{trailer.audience_promise ?? "Audience promise"}</h2><ol>{trailer.segments.map((segment) => <li key={segment.id}><strong>{segment.label}</strong><span>{segment.start} - {segment.end} · {segment.tone}</span><p>{segment.reason ?? "Source-backed story beat."}</p></li>)}</ol></div></section><aside><section className="panel"><div className="eyebrow">Validation</div>{trailer.validation.checks.map((check, index) => { const Icon = check.status === "pass" ? Check : check.status === "warning" ? TriangleAlert : X; return <div className="check-row" key={`${check.name}-${index}`}><Icon size={15} className={`check-${check.status}`} /><div><strong>{check.name}</strong><span>{check.detail}</span></div></div>; })}</section><section className="panel review-controls"><div className="eyebrow">Review decision</div><p className="review-status">Round {trailer.review_round ?? 0} · {trailer.review_status ?? "PENDING"}</p><textarea className="review-feedback" value={feedback} onChange={(event) => setFeedback(event.target.value)} placeholder="Make the opening hook faster, remove a spoiler, change the emotional emphasis..." /><div className="review-actions"><button className="review-pass" onClick={() => submit("pass")} disabled={loading}><Check size={15} /> Pass</button><button className="review-fail" onClick={() => submit("fail")} disabled={loading}><X size={15} /> Request changes</button><button className="review-regenerate" onClick={() => submit("regenerate")} disabled={loading}><RefreshCw size={15} /> Regenerate</button></div>{message && <p className="review-message">{message}</p>}</section></aside></div></main>;
+}
+
+export default function ReviewRoute() {
+  return <Suspense fallback={<main className="page"><h1>Loading the cut.</h1></main>}><ReviewPage /></Suspense>;
 }
