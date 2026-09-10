@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from uuid import uuid4
@@ -22,6 +23,7 @@ from src.logging.decision_log import DecisionLog
 from src.orchestration.pipeline import AUDIENCES, build_plan
 from src.planning.audience_strategy import AUDIENCE_GOALS
 from src.verification.validator import Validator
+from src.orchestration.review_graph import regenerate_review
 
 
 load_dotenv()
@@ -164,6 +166,7 @@ class PromiseArcUpdate(BaseModel):
     audience_profile: str = ""
     audience_promise: str
     narrative_arc: list[PromiseBeat]
+    feedback: str = ""
 
 
 class AudienceCandidate(BaseModel):
@@ -175,6 +178,27 @@ class AudienceCandidate(BaseModel):
 
 class AudienceCandidates(BaseModel):
     candidates: list[AudienceCandidate] = Field(default_factory=list)
+
+
+class ReviewRequest(BaseModel):
+    action: str
+    feedback: str = ""
+
+
+class PlotReprocessRequest(BaseModel):
+    feedback: str = ""
+
+
+class PlotBeatProposal(BaseModel):
+    scene_id: str
+    beat_name: str
+    emotional_goal: str
+    included: bool = True
+
+
+class PlotRevision(BaseModel):
+    audience_promise: str
+    beats: list[PlotBeatProposal] = Field(default_factory=list)
 
 
 STORY_MAP_PROMPT = """
@@ -305,6 +329,9 @@ async def create_run(
         "filename": safe_name,
         "video_path": str(video_path),
         "supporting_files": supporting_files,
+        "review_status": "PENDING",
+        "review_feedback": "",
+        "review_round": 0,
     }
     save_runs()
     return {"runId": run_id}
@@ -385,7 +412,7 @@ serves the audience in emotional_goal.
     return plan
 
 
-def promise_arc_from_plan(plan: dict) -> dict:
+def promise_arc_from_plan(plan: dict, feedback: str = "") -> dict:
     """Expose the intent that precedes clip selection in an editable form."""
     beat_names = ("Introduction / Setup", "Conflict / Turning Point", "Resolution / Core Message")
     return {
@@ -404,6 +431,7 @@ def promise_arc_from_plan(plan: dict) -> dict:
             for index, segment in enumerate(plan["segments"])
         ],
         "validation_status": plan["validation"]["status"],
+        "feedback": feedback,
     }
 
 
@@ -511,50 +539,11 @@ def trailer_from_plan(run_id: str, plan: dict, title: str) -> dict:
 
 @app.get("/runs/{run_id}/media")
 def get_media(run_id: str) -> FileResponse:
-    run = get_run(run_id)
+    """Ask the model to revise the plot from the director's feedback."""
     media_path = Path(run.get("video_path", ""))
     if not media_path.is_file():
         raise HTTPException(status_code=404, detail="Uploaded media is no longer available")
     return FileResponse(media_path)
-
-
-def render_segments(run_id: str, run: dict) -> Path:
-    """Slice the validated EDL and concatenate the clips into one video."""
-    media_path = Path(run.get("video_path", ""))
-    if not media_path.is_file():
-        raise HTTPException(status_code=404, detail="Uploaded media is no longer available")
-    segments = run.get("trailer", {}).get("segments", [])
-    if not segments:
-        raise HTTPException(status_code=422, detail="The validated timeline has no included clips")
-    RENDER_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = RENDER_DIR / f"{run_id}.mp4"
-    inputs = []
-    filters = []
-    for index, segment in enumerate(segments):
-        start = parse_timecode(segment["start"])
-        end = parse_timecode(segment["end"])
-        inputs.extend(["-ss", str(start), "-t", str(end - start), "-i", str(media_path)])
-        filters.append(f"[{index}:v]setpts=PTS-STARTPTS[v{index}]")
-        filters.append(f"[{index}:a]aresample=async=1:first_pts=0[a{index}]")
-    video_inputs = "".join(f"[v{index}][a{index}]" for index in range(len(segments)))
-    filters.append(f"{video_inputs}concat=n={len(segments)}:v=1:a=1[vout][aout]")
-    ffmpeg_executable = shutil.which("ffmpeg")
-    if not ffmpeg_executable:
-        winget_root = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
-        matches = list(winget_root.glob("Gyan.FFmpeg*/*/bin/ffmpeg.exe"))
-        ffmpeg_executable = str(matches[0]) if matches else "ffmpeg"
-    command = [ffmpeg_executable, "-y", *inputs, "-filter_complex", ";".join(filters), "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", str(output_path)]
-    try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
-    except FileNotFoundError:
-        return render_segments_with_opencv(segments, media_path, output_path)
-    except subprocess.CalledProcessError as exc:
-        detail = "FFmpeg is required to render the final trailer."
-        if exc.stderr:
-            logger.error("Trailer render failed: %s", exc.stderr[-2000:])
-            detail = "The final trailer could not be rendered. Check the uploaded media and FFmpeg installation."
-        raise HTTPException(status_code=503, detail=detail) from exc
-    return output_path
 
 
 def render_segments_with_opencv(segments: list[dict], media_path: Path, output_path: Path) -> Path:
@@ -603,6 +592,104 @@ def get_trailer(run_id: str) -> dict:
     return get_run(run_id)["trailer"]
 
 
+@app.post("/runs/{run_id}/plot/reprocess")
+def reprocess_plot(run_id: str, request: PlotReprocessRequest, audience: str = "family") -> dict:
+    """Discard the cached plot and generate a fresh audience-specific proposal."""
+    run = get_run(run_id)
+    if run_id == "demo-run" or audience not in AUDIENCES:
+        raise HTTPException(status_code=400, detail="A real run and supported audience are required.")
+    run.setdefault("audience_arc_cache", {}).pop(audience, None)
+    feedback = request.feedback.strip()
+    requests_more_beats = any(phrase in feedback.lower() for phrase in ("one more beat", "another beat", "additional beat", "more beats", "more beat"))
+    feedback_lower = feedback.lower()
+    remove_match = re.search(r"remove\s+(?:the\s+)?(?:(\d+)(?:st|nd|rd|th)?|first|second|third|last)\s+beat", feedback_lower)
+    try:
+        if remove_match and run.get("plans", {}).get(audience):
+            plan = deepcopy(run["plans"][audience])
+        else:
+            plan = build_plan(audience, planning_story_map(run), run["constraint_map"], DecisionLog()) if (requests_more_beats or not os.environ.get("GEMINI_API_KEY")) else reanalyze_audience_plan(run_id, run, audience)
+    except Exception as exc:
+        logger.warning("Plot reprocessing failed for %s/%s: %s", run_id, audience, exc)
+        raise HTTPException(status_code=502, detail="The plot could not be reprocessed.") from exc
+    if requests_more_beats and len(plan.get("segments", [])) < 3:
+        deterministic_plan = build_plan(audience, planning_story_map(run), run["constraint_map"], DecisionLog())
+        existing_scene_ids = {segment.get("scene_id") for segment in plan.get("segments", [])}
+        additions = [segment for segment in deterministic_plan["segments"] if segment.get("scene_id") not in existing_scene_ids]
+        plan["segments"].extend(additions[: 3 - len(plan["segments"])])
+        plan["segments"].sort(key=lambda segment: segment.get("start", 0))
+        plan["duration_seconds"] = sum(segment["end"] - segment["start"] for segment in plan["segments"])
+        plan["validation"] = deterministic_plan["validation"]
+    if remove_match and plan.get("segments"):
+        requested = remove_match.group(1)
+        if "last" in remove_match.group(0):
+            remove_index = len(plan["segments"]) - 1
+        elif "first" in remove_match.group(0):
+            remove_index = 0
+        elif "second" in remove_match.group(0):
+            remove_index = 1
+        elif "third" in remove_match.group(0):
+            remove_index = 2
+        else:
+            remove_index = int(requested) - 1
+        if 0 <= remove_index < len(plan["segments"]):
+            plan["segments"].pop(remove_index)
+            plan["duration_seconds"] = sum(segment["end"] - segment["start"] for segment in plan["segments"])
+            plan["validation"] = Validator().validate(plan["segments"], {
+                "scene_ids": run["constraint_map"].get("metadata", {}).get("scene_ids", []),
+                "cleared_scene_ids": run["constraint_map"].get("metadata", {}).get("cleared_scene_ids", []),
+                "expired_assets": run["constraint_map"].get("metadata", {}).get("expired_assets", []),
+                "protected_facts": run["constraint_map"].get("metadata", {}).get("protected_facts", []),
+                "audience": audience, "estimated_cost_usd": 0.02,
+                "max_cost_usd": run["constraint_map"].get("metadata", {}).get("max_cost_usd", 1.0),
+            })
+    plot = promise_arc_from_plan(plan, feedback)
+    run["plans"][audience] = plan
+    run.setdefault("audience_arc_cache", {})[audience] = plot
+    save_runs()
+    return plot
+
+
+@app.post("/runs/{run_id}/review")
+def review_trailer(run_id: str, review: ReviewRequest) -> dict:
+    """Record approval or run a LangGraph-backed feedback regeneration."""
+    run = get_run(run_id)
+    if run_id == "demo-run":
+        raise HTTPException(status_code=400, detail="The demo trailer cannot be reviewed.")
+    if review.action not in {"pass", "fail", "regenerate"}:
+        raise HTTPException(status_code=400, detail="Review action must be pass, fail, or regenerate.")
+    feedback = review.feedback.strip()
+    if review.action == "fail" and not feedback:
+        raise HTTPException(status_code=422, detail="Feedback is required when rejecting a trailer.")
+    if review.action == "pass":
+        run["review_status"] = "PASSED"
+        run["review_feedback"] = feedback
+    elif review.action == "fail":
+        run["review_status"] = "NEEDS_REVISION"
+        run["review_feedback"] = feedback
+    else:
+        plan = run["plans"].get(run["trailer"]["audience"], run["plans"]["family"])
+        result = regenerate_review({
+            "audience": plan["audience"],
+            "story_map": planning_story_map(run),
+            "constraint_map": run["constraint_map"],
+            "audience_promise": plan.get("audience_promise", ""),
+            "feedback": feedback or run.get("review_feedback", ""),
+            "plan": plan,
+            "validation": plan["validation"],
+            "review_status": "NEEDS_REVISION",
+        })
+        run["plans"][plan["audience"]] = result["plan"]
+        run["trailer"] = trailer_from_plan(run_id, result["plan"], run["story_map"]["title"])
+        run["review_status"] = "PENDING"
+        run["review_feedback"] = feedback or run.get("review_feedback", "")
+        run["review_round"] = run.get("review_round", 0) + 1
+    run["trailer"]["review_status"] = run["review_status"]
+    run["trailer"]["review_feedback"] = run.get("review_feedback", "")
+    run["trailer"]["review_round"] = run.get("review_round", 0)
+    save_runs()
+    return {"trailer": run["trailer"], "review_status": run["review_status"], "review_round": run["review_round"]}
+
+
 @app.get("/runs/{run_id}/promise-arc")
 def get_promise_arc(run_id: str, audience: str | None = None) -> dict:
     run = get_run(run_id)
@@ -616,7 +703,7 @@ def get_promise_arc(run_id: str, audience: str | None = None) -> dict:
         if audience in arc_cache:
             return arc_cache[audience]
         try:
-            plan = reanalyze_audience_plan(run_id, run, audience) if os.environ.get("GEMINI_API_KEY") else build_plan(audience, planning_story_map(run), run["constraint_map"], DecisionLog())
+            plan = build_plan(audience, planning_story_map(run), run["constraint_map"], DecisionLog())
         except Exception as exc:
             logger.warning("Audience media re-analysis failed for %s/%s; using deterministic fallback: %s", run_id, audience, exc)
             plan = build_plan(audience, planning_story_map(run), run["constraint_map"], DecisionLog())
@@ -655,7 +742,7 @@ def update_promise_arc(run_id: str, update: PromiseArcUpdate) -> dict:
             "label": beat.beat_name,
             "audio": "original_dialogue", "subtitle": "source_subtitles", "tone": scene.get("tone") or "discovery",
             "sensitive_content": scene.get("sensitiveContent", scene.get("sensitive_content", [])),
-            "reason": beat.emotional_goal, "evidence": [f"scene:{beat.scene_id}", "human:promise_arc_edit"],
+            "reason": f"{beat.emotional_goal}{f' Reviewer note: {update.feedback.strip()}' if update.feedback.strip() else ''}", "evidence": [f"scene:{beat.scene_id}", "human:promise_arc_edit", *(["human:plot_feedback"] if update.feedback.strip() else [])],
             "risk_flags": [], "scene_id": beat.scene_id, "start": source_in, "end": source_out,
             "spoiler_level": scene.get("spoilerLevel", scene.get("spoiler_level", "low")),
         })

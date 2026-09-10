@@ -144,3 +144,15 @@ def test_api_trailer_export_escalates_warning_status() -> None:
     )
 
     assert trailer["validation"]["status"] == "PASS_WITH_WARNINGS"
+
+
+def test_plot_reprocess_removes_requested_beat() -> None:
+    from api import PlotReprocessRequest, reprocess_plot
+
+    result = reprocess_plot(
+        "8512d486-4a36-4005-a5a8-5d12e40baf55",
+        PlotReprocessRequest(feedback="Remove third beat"),
+        "family",
+    )
+
+    assert len(result["narrative_arc"]) == 2

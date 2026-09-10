@@ -25,7 +25,7 @@ export default function PromiseArcPage() {
 
   useEffect(() => {
     if (!runId) return;
-    getPromiseArc(runId).then((loadedArc) => { setArc(loadedArc); setSelectedAudience(loadedArc.audience as Audience); setAudienceArcs({ [loadedArc.audience as Audience]: loadedArc }); }).catch((requestError) => setError(requestError instanceof Error ? requestError.message : "This run's audience promise could not be loaded."));
+    router.replace(`/audience?run=${runId}`);
   }, [runId]);
 
   async function changeAudience(audience: Audience) {

@@ -51,6 +51,9 @@ export type TrailerRun = {
   }[];
   validation: Validation;
   evidence: string[];
+  review_status?: "PENDING" | "PASSED" | "NEEDS_REVISION";
+  review_feedback?: string;
+  review_round?: number;
 };
 
 export type PromiseBeat = {
@@ -68,6 +71,7 @@ export type PromiseArc = {
   audience_promise: string;
   narrative_arc: PromiseBeat[];
   validation_status: Validation["status"];
+  feedback?: string;
 };
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -87,7 +91,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new Error(`API request failed: ${response.status}${detail}`);
   }
-  return response.json() as Promise<T>;
+  const text = await response.text();
+  if (!text.trim()) throw new Error(`API returned an empty response for ${path}. Restart the API and try again.`);
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`API returned invalid JSON for ${path}. Check the API logs.`);
+  }
 }
 
 export type EvidencePackage = {
@@ -128,6 +138,13 @@ export function renderTrailer(runId: string): Promise<{ url: string; filename: s
   return request<{ url: string; filename: string }>(`/runs/${runId}/render`, { method: "POST" });
 }
 
+export function reviewTrailer(runId: string, action: "pass" | "fail" | "regenerate", feedback = ""): Promise<{ trailer: TrailerRun; review_status: string; review_round: number }> {
+  return request<{ trailer: TrailerRun; review_status: string; review_round: number }>(`/runs/${runId}/review`, {
+    method: "POST",
+    body: JSON.stringify({ action, feedback }),
+  });
+}
+
 export function getPromiseArc(runId: string, audience?: Audience): Promise<PromiseArc> {
   const query = audience ? `?audience=${encodeURIComponent(audience)}` : "";
   return request<PromiseArc>(`/runs/${runId}/promise-arc${query}`);
@@ -137,6 +154,13 @@ export function updatePromiseArc(runId: string, arc: PromiseArc): Promise<{ prom
   return request<{ promise_arc: PromiseArc; trailer: TrailerRun }>(`/runs/${runId}/promise-arc`, {
     method: "POST",
     body: JSON.stringify(arc),
+  });
+}
+
+export function reprocessPlot(runId: string, audience: Audience, feedback = ""): Promise<PromiseArc> {
+  return request<PromiseArc>(`/runs/${runId}/plot/reprocess?audience=${encodeURIComponent(audience)}`, {
+    method: "POST",
+    body: JSON.stringify({ feedback }),
   });
 }
 
