@@ -1,8 +1,9 @@
 from pathlib import Path
 
-from api import StoryScene, normalize_scenes
+from api import StoryScene, normalize_scenes, trailer_from_plan
 from orchestration.pipeline import AUDIENCES, run_director
 from verification.validator import Validator
+from models.edl import build_edl
 
 
 def test_replay_generates_three_distinct_audience_plans(tmp_path: Path) -> None:
@@ -62,3 +63,84 @@ def test_validator_rejects_spoiler_and_invalid_timing() -> None:
     assert result["status"] == "REJECT"
     failure_checks = {failure["check"] for failure in result["failures"]}
     assert {"spoiler", "timing"}.issubset(failure_checks)
+
+
+def test_edl_exports_auditable_assignment_segments() -> None:
+    edl = build_edl({
+        "audience": "family",
+        "audience_promise": "Warmth and broad entertainment value",
+        "segments": [{
+            "scene_id": "scene_01",
+            "start": 13.0,
+            "end": 27.0,
+            "source_in": 13.0,
+            "source_out": 27.0,
+            "tone": "Calm",
+            "audio": "dialogue_and_music",
+            "subtitle": "standard_track",
+            "reason": "Establishes the setup safely.",
+            "evidence": ["scene:scene_01", "policy:no_major_spoilers"],
+            "risk_flags": [],
+        }],
+        "validation": {"status": "PASS", "failures": [], "checks": []},
+        "constraint_map": {"metadata": {"cleared_scene_ids": []}},
+    })
+
+    segment = edl["segments"][0]
+    assert segment["source_in"] == "00:00:13"
+    assert segment["audio"] == "dialogue_and_music"
+    assert segment["evidence"][-1] == "contract:pending-human-clearance"
+    assert segment["validation"]["status"] == "PASS"
+
+
+def test_api_trailer_export_keeps_required_segment_metadata() -> None:
+    trailer = trailer_from_plan(
+        "run-1",
+        {
+            "trailer_id": "family_v1",
+            "audience": "family",
+            "duration_seconds": 14.0,
+            "audience_promise": "Communicate warmth",
+            "segments": [{
+                "video": "scene_1",
+                "scene_id": "scene_1",
+                "source_in": 54.0,
+                "source_out": 87.0,
+                "start": 54.0,
+                "end": 87.0,
+                "tone": "affectionate",
+                "audio": "dialogue_and_music",
+                "subtitle": "standard_track",
+                "reason": "Establishes the relationship safely.",
+                "evidence": ["scene:scene_1"],
+                "risk_flags": [],
+            }],
+            "validation": {"status": "PASS_WITH_WARNINGS", "checks": []},
+        },
+        "Episode",
+    )
+
+    segment = trailer["segments"][0]
+    assert segment["source_in"] == "00:00:54"
+    assert segment["source_out"] == "00:01:27"
+    assert segment["evidence"][-1] == "contract:pending-human-clearance"
+    assert segment["reason"]
+    assert segment["is_included"] is True
+
+
+def test_api_trailer_export_escalates_warning_status() -> None:
+    trailer = trailer_from_plan(
+        "run-1",
+        {
+            "audience": "family",
+            "duration_seconds": 1.0,
+            "segments": [],
+            "validation": {
+                "status": "PASS",
+                "checks": [{"name": "Rights", "status": "warning", "detail": "Approval pending"}],
+            },
+        },
+        "Episode",
+    )
+
+    assert trailer["validation"]["status"] == "PASS_WITH_WARNINGS"

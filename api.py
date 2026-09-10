@@ -201,11 +201,27 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def save_supporting_upload(upload: UploadFile | None, run_id: str, label: str) -> dict[str, str] | None:
+    if upload is None:
+        return None
+    safe_name = Path(upload.filename or f"{label}.bin").name
+    path = UPLOAD_DIR / f"{run_id}_{label}_{safe_name}"
+    with path.open("wb") as destination:
+        shutil.copyfileobj(upload.file, destination)
+    result = {"filename": safe_name, "path": str(path)}
+    if path.suffix.lower() in {".json", ".txt", ".csv", ".srt", ".vtt"}:
+        result["content"] = path.read_text(encoding="utf-8", errors="replace")[:20000]
+    return result
+
+
 @app.post("/runs")
 async def create_run(
     episode: UploadFile = File(...),
     audience: str = Form("family"),
     model: str = Form(""),
+    scene_descriptions: UploadFile | None = File(None),
+    dialogue_subtitles: UploadFile | None = File(None),
+    policies_metadata: UploadFile | None = File(None),
 ) -> dict[str, str]:
     run_id = str(uuid4())
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -214,6 +230,16 @@ async def create_run(
     with video_path.open("wb") as destination:
         shutil.copyfileobj(episode.file, destination)
     logger.info("Saved uploaded episode %s (%d bytes)", safe_name, video_path.stat().st_size)
+    supporting_files = {
+        "scene_descriptions": save_supporting_upload(scene_descriptions, run_id, "scenes"),
+        "dialogue_subtitles": save_supporting_upload(dialogue_subtitles, run_id, "dialogue"),
+        "policies_metadata": save_supporting_upload(policies_metadata, run_id, "policies"),
+    }
+    evidence_context = {
+        key: {field: value for field, value in (item or {}).items() if field != "path"}
+        for key, item in supporting_files.items()
+        if item
+    }
     selected_model = model or os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
     if not selected_model.startswith("gemini-"):
         video_path.unlink(missing_ok=True)
@@ -224,7 +250,7 @@ async def create_run(
         generated = llm.generate_structured(
             system_prompt=STORY_MAP_PROMPT,
             media=str(video_path),
-            context={"audience": audience, "filename": safe_name},
+            context={"audience": audience, "filename": safe_name, "supporting_evidence": evidence_context},
             response_schema=GeneratedStoryMap,
             cache_key=run_id,
             model=selected_model,
@@ -278,6 +304,7 @@ async def create_run(
         "decision_log": log.as_list(),
         "filename": safe_name,
         "video_path": str(video_path),
+        "supporting_files": supporting_files,
     }
     save_runs()
     return {"runId": run_id}
@@ -432,27 +459,50 @@ def normalize_scenes(scenes: list[StoryScene], video_path: Path) -> list[dict]:
 
 
 def trailer_from_plan(run_id: str, plan: dict, title: str) -> dict:
+    validation = plan["validation"]
+    validation_status = validation["status"]
+    if validation_status == "PASS" and any(check.get("status") == "warning" for check in validation.get("checks", [])):
+        validation_status = "PASS_WITH_WARNINGS"
+    if any(check.get("status") == "fail" for check in validation.get("checks", [])):
+        validation_status = "REJECT"
+    contract_link = "contract:pending-human-clearance"
     return {
         "id": run_id,
+        "trailer_id": plan.get("trailer_id", run_id),
         "title": title,
         "audience": plan["audience"],
         "runtime": format_timecode(plan["duration_seconds"]),
+        "duration_seconds": plan["duration_seconds"],
+        "audience_promise": plan.get("audience_promise", ""),
         "segments": [
             {
                 "id": chr(97 + index),
                 "label": segment.get("label", segment["video"]),
+                "scene_id": segment["scene_id"],
                 "sceneId": segment["scene_id"],
+                "source_in": format_timecode(segment["source_in"]),
+                "source_out": format_timecode(segment["source_out"]),
                 "start": format_timecode(segment["start"]),
                 "end": format_timecode(segment["end"]),
                 "tone": segment.get("tone", "discovery"),
+                "audio": segment.get("audio", "original_dialogue"),
+                "subtitle": segment.get("subtitle", "source_subtitles"),
+                "reason": segment.get("reason", ""),
+                "evidence": list(dict.fromkeys([*segment.get("evidence", []), contract_link])),
+                "risk_flags": segment.get("risk_flags", []),
+                "validation": {
+                    "status": validation_status,
+                    "checks": validation.get("checks", []),
+                },
+                "is_included": segment.get("is_included", True),
             }
             for index, segment in enumerate(plan["segments"])
         ],
         "validation": {
-            "status": plan["validation"]["status"],
+            "status": validation_status,
             "checks": [
                 {"name": check["name"], "status": check["status"], "detail": check["detail"]}
-                for check in plan["validation"]["checks"]
+                for check in validation["checks"]
             ],
         },
         "evidence": [evidence for segment in plan["segments"] for evidence in segment["evidence"]],

@@ -25,10 +25,30 @@ export type Validation = {
 
 export type TrailerRun = {
   id: string;
+  trailer_id?: string;
   title: string;
   audience: Audience;
   runtime: string;
-  segments: { id: string; label: string; sceneId: string; start: string; end: string; tone: string }[];
+  duration_seconds?: number;
+  audience_promise?: string;
+  segments: {
+    id: string;
+    label: string;
+    scene_id?: string;
+    sceneId: string;
+    source_in?: string;
+    source_out?: string;
+    start: string;
+    end: string;
+    tone: string;
+    audio?: string;
+    subtitle?: string;
+    reason?: string;
+    evidence?: string[];
+    risk_flags?: string[];
+    validation?: { status: string; checks: Validation["checks"] };
+    is_included?: boolean;
+  }[];
   validation: Validation;
   evidence: string[];
 };
@@ -70,10 +90,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export async function uploadEpisode(file: File, audience: Audience): Promise<{ runId: string }> {
+export type EvidencePackage = {
+  sceneDescriptions?: File | null;
+  dialogueSubtitles?: File | null;
+  policiesMetadata?: File | null;
+};
+
+export async function uploadEpisode(file: File, audience: Audience, evidence: EvidencePackage = {}): Promise<{ runId: string }> {
   const body = new FormData();
   body.append("episode", file);
   body.append("audience", audience);
+  if (evidence.sceneDescriptions) body.append("scene_descriptions", evidence.sceneDescriptions);
+  if (evidence.dialogueSubtitles) body.append("dialogue_subtitles", evidence.dialogueSubtitles);
+  if (evidence.policiesMetadata) body.append("policies_metadata", evidence.policiesMetadata);
   const response = await fetch(`${API_URL}/runs`, { method: "POST", body });
   if (!response.ok) throw new Error(`Upload failed: ${response.status}`);
   return response.json() as Promise<{ runId: string }>;

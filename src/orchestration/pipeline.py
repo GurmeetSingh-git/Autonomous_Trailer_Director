@@ -69,6 +69,8 @@ def build_plan(audience: str, story_map: dict[str, Any], constraint_map: dict[st
     selected = sorted(selected[:3], key=lambda scene: scene.get("start", 0))
     segments = [
         {
+            "id": chr(ord("a") + index),
+            "label": scene.get("title", scene["id"]),
             "source_in": edit_start,
             "source_out": edit_end,
             "video": scene["id"],
@@ -84,7 +86,7 @@ def build_plan(audience: str, story_map: dict[str, Any], constraint_map: dict[st
             "end": edit_end,
             "spoiler_level": scene["spoiler_level"],
         }
-        for scene in selected
+        for index, scene in enumerate(selected)
         for edit_start, edit_end in [_audience_edit_range(audience, scene)]
     ]
     validation = Validator().validate(
