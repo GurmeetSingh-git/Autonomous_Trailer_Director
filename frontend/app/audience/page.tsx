@@ -11,9 +11,10 @@ function AudiencePage() {
   const searchParams = useSearchParams();
   const runId = searchParams.get("run");
   const [audience, setAudience] = useState<Audience>("family");
+  const [reanalyze, setReanalyze] = useState(false);
 
   if (!runId) return <main className="page"><div className="eyebrow">Audience lens</div><h1>Choose an uploaded run.</h1><p className="lede">Audience selection needs a real analyzed episode.</p><Link className="mono" href="/">Return to upload</Link></main>;
-  return <main className="page"><div className="eyebrow">Audience lens / screen 03</div><h1>Who are we inviting in?</h1><p className="lede">Choose the audience first. The director will shape a trailer plot around that promise before selecting a single clip.</p><section className="panel audience-choice"><div className="eyebrow"><Users size={13} style={{ verticalAlign: "middle" }} /> Direction</div><h2>Set the audience lens.</h2><AudienceTabs value={audience} onChange={setAudience} /><Link className="primary-button audience-next" href={`/plot?run=${runId}&audience=${audience}`}>Generate trailer plot <ArrowRight size={15} /></Link></section></main>;
+  return <main className="page"><div className="eyebrow">Audience lens / screen 03</div><h1>Who are we inviting in?</h1><p className="lede">Choose the audience first. The director will shape a trailer plot around that promise before selecting a single clip.</p><section className="panel audience-choice"><div className="eyebrow"><Users size={13} style={{ verticalAlign: "middle" }} /> Direction</div><h2>Set the audience lens.</h2><AudienceTabs value={audience} onChange={setAudience} /><label className="reanalyze-toggle"><input type="checkbox" checked={reanalyze} onChange={(event) => setReanalyze(event.target.checked)} /><span><strong>Re-analyze source video</strong><small>Ask Gemini to find fresh moments for this audience.</small></span></label><Link className="primary-button audience-next" href={`/plot?run=${runId}&audience=${audience}&reanalyze=${reanalyze}`}>Generate trailer plot <ArrowRight size={15} /></Link></section></main>;
 }
 
 export default function AudienceRoute() {

@@ -145,8 +145,11 @@ export function reviewTrailer(runId: string, action: "pass" | "fail" | "regenera
   });
 }
 
-export function getPromiseArc(runId: string, audience?: Audience): Promise<PromiseArc> {
-  const query = audience ? `?audience=${encodeURIComponent(audience)}` : "";
+export function getPromiseArc(runId: string, audience?: Audience, reanalyze = false): Promise<PromiseArc> {
+  const params = new URLSearchParams();
+  if (audience) params.set("audience", audience);
+  if (reanalyze) params.set("reanalyze", "true");
+  const query = params.toString() ? `?${params.toString()}` : "";
   return request<PromiseArc>(`/runs/${runId}/promise-arc${query}`);
 }
 

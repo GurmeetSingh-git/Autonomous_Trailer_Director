@@ -43,7 +43,7 @@ function PromiseArcPage() {
   }
 
   async function regenerateAudience() {
-    if (!runId || selectedAudience === arc?.audience && audienceArcs[selectedAudience]) return;
+    if (!runId || (selectedAudience === arc?.audience && audienceArcs[selectedAudience])) return;
     setSaving(true); setError("");
     try {
       const regeneratedArc = await getPromiseArc(runId, selectedAudience);

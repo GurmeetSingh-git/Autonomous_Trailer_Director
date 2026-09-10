@@ -795,7 +795,7 @@ def review_trailer(run_id: str, review: ReviewRequest) -> dict:
 
 
 @app.get("/runs/{run_id}/promise-arc")
-def get_promise_arc(run_id: str, audience: str | None = None) -> dict:
+def get_promise_arc(run_id: str, audience: str | None = None, reanalyze: bool = False) -> dict:
     run = get_run(run_id)
     if audience:
         if audience not in AUDIENCES:
@@ -804,17 +804,25 @@ def get_promise_arc(run_id: str, audience: str | None = None) -> dict:
             run["audience_arc_cache"] = {}
             run["audience_arc_cache_version"] = AUDIENCE_ARC_CACHE_VERSION
         arc_cache = run.setdefault("audience_arc_cache", {})
-        if audience in arc_cache:
+
+        if not reanalyze and audience in arc_cache:
             return arc_cache[audience]
+
         try:
-            plan = build_plan(audience, planning_story_map(run), run["constraint_map"], DecisionLog())
+            if reanalyze:
+                plan = reanalyze_audience_plan(run_id, run, audience)
+            else:
+                plan = build_plan(audience, planning_story_map(run), run["constraint_map"], DecisionLog())
         except Exception as exc:
-            logger.warning("Audience media re-analysis failed for %s/%s; using deterministic fallback: %s", run_id, audience, exc)
+            logger.warning("Audience %s failed for %s/%s; falling back to stored data: %s",
+                            "reanalysis" if reanalyze else "planning", run_id, audience, exc)
             plan = build_plan(audience, planning_story_map(run), run["constraint_map"], DecisionLog())
+
         run["plans"][audience] = plan
         arc_cache[audience] = promise_arc_from_plan(plan)
         save_runs()
         return arc_cache[audience]
+
     if "promise_arc" in run:
         promise_arc = run["promise_arc"]
         if "audience" in promise_arc:

@@ -11,6 +11,7 @@ function PlotPage() {
   const router = useRouter();
   const runId = searchParams.get("run");
   const audience = (searchParams.get("audience") ?? "family") as Audience;
+  const reanalyze = searchParams.get("reanalyze") === "true";
   const [arc, setArc] = useState<PromiseArc | null>(null);
   const [error, setError] = useState("");
   const [accepting, setAccepting] = useState(false);
@@ -19,8 +20,8 @@ function PlotPage() {
 
   useEffect(() => {
     if (!runId) return;
-    getPromiseArc(runId, audience).then((loadedArc) => { setArc(loadedArc); setFeedback(loadedArc.feedback ?? ""); }).catch((requestError) => setError(requestError instanceof Error ? requestError.message : "The trailer plot could not be generated."));
-  }, [runId, audience]);
+    getPromiseArc(runId, audience, reanalyze).then((loadedArc) => { setArc(loadedArc); setFeedback(loadedArc.feedback ?? ""); }).catch((requestError) => setError(requestError instanceof Error ? requestError.message : "The trailer plot could not be generated."));
+  }, [runId, audience, reanalyze]);
 
   function updateBeat(index: number, field: "beat_name" | "emotional_goal", value: string) {
     if (!arc) return;
