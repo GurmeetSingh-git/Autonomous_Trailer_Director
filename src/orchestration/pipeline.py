@@ -35,7 +35,7 @@ def _audience_edit_range(audience: str, scene: dict[str, Any]) -> tuple[float, f
     duration = end - start
     start_ratio, end_ratio = AUDIENCE_OFFSETS.get(audience, (0.0, 0.0))
     adjusted_start = min(end - 0.5, start + duration * start_ratio)
-    adjusted_end = min(end, end + duration * end_ratio)
+    adjusted_end = min(float(scene["end"]), end + duration * end_ratio)
     return adjusted_start, max(adjusted_start + 0.5, adjusted_end)
 
 
