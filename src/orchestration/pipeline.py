@@ -96,6 +96,7 @@ def build_plan(audience: str, story_map: dict[str, Any], constraint_map: dict[st
         "cleared_scene_ids": constraint_map.get("metadata", {}).get("cleared_scene_ids", []),
         "expired_assets": constraint_map.get("metadata", {}).get("expired_assets", []),
         "protected_facts": constraint_map.get("metadata", {}).get("protected_facts", []),
+        "scenes": scenes,   
         "audience": audience,
         "estimated_cost_usd": 0.02,
         "max_cost_usd": constraint_map.get("metadata", {}).get("max_cost_usd", 1.0),

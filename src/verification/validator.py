@@ -10,6 +10,7 @@ try:
     from src.verification.rating_check import check as rating_check
     from src.verification.rights_check import check as rights_check
     from src.verification.spoiler_check import check as spoiler_check
+    from src.verification.grounding_check import check as grounding_check
 except ModuleNotFoundError:
     from verification.accessibility_check import check as accessibility_check
     from verification.bias_check import check as bias_check
@@ -18,6 +19,7 @@ except ModuleNotFoundError:
     from verification.rating_check import check as rating_check
     from verification.rights_check import check as rights_check
     from verification.spoiler_check import check as spoiler_check
+    
 
 
 class Validator:
@@ -51,6 +53,7 @@ class Validator:
             ("Bias", bias_check(candidate, context)),
             ("Budget", budget_check(candidate, context)),
             ("Prompt injection", injection_check(candidate, context)),
+            ("Grounding", grounding_check(candidate, context)),
         ):
             check_results.append({"name": name, "severity": result["status"], "status": result["status"], "detail": result["detail"]})
             if result["status"] == "fail":
@@ -71,6 +74,7 @@ def run_checks(segments: list[dict], story_map: dict, constraint_map: dict, audi
             "cleared_scene_ids": metadata.get("cleared_scene_ids", []),
             "expired_assets": metadata.get("expired_assets", []),
             "protected_facts": metadata.get("protected_facts", []),
+            "scenes": story_map.get("scenes", []), 
             "audience": audience,
             "estimated_cost_usd": 0.02,
             "max_cost_usd": metadata.get("max_cost_usd", 1.0),

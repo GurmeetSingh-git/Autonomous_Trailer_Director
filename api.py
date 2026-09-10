@@ -405,6 +405,7 @@ serves the audience in emotional_goal.
         "cleared_scene_ids": run["constraint_map"].get("metadata", {}).get("cleared_scene_ids", []),
         "expired_assets": run["constraint_map"].get("metadata", {}).get("expired_assets", []),
         "protected_facts": run["constraint_map"].get("metadata", {}).get("protected_facts", []),
+        "scenes": story_map["scenes"],
         "audience": audience, "estimated_cost_usd": 0.02,
         "max_cost_usd": run["constraint_map"].get("metadata", {}).get("max_cost_usd", 1.0),
     })
@@ -731,6 +732,7 @@ Return only story beats, not clip timecodes or editing instructions.
                 "cleared_scene_ids": run["constraint_map"].get("metadata", {}).get("cleared_scene_ids", []),
                 "expired_assets": run["constraint_map"].get("metadata", {}).get("expired_assets", []),
                 "protected_facts": run["constraint_map"].get("metadata", {}).get("protected_facts", []),
+                "scenes": planning_story_map(run).get("scenes", []),
                 "audience": audience, "estimated_cost_usd": 0.02,
                 "max_cost_usd": run["constraint_map"].get("metadata", {}).get("max_cost_usd", 1.0),
             })
@@ -741,6 +743,7 @@ Return only story beats, not clip timecodes or editing instructions.
             "cleared_scene_ids": metadata.get("cleared_scene_ids", []),
             "expired_assets": metadata.get("expired_assets", []),
             "protected_facts": metadata.get("protected_facts", []),
+            "scenes": planning_story_map(run).get("scenes", []),
             "audience": audience,
             "estimated_cost_usd": 0.02,
             "max_cost_usd": metadata.get("max_cost_usd", 1.0),
@@ -867,6 +870,7 @@ def update_promise_arc(run_id: str, update: PromiseArcUpdate) -> dict:
         "cleared_scene_ids": constraint_map.get("metadata", {}).get("cleared_scene_ids", []),
         "expired_assets": constraint_map.get("metadata", {}).get("expired_assets", []),
         "protected_facts": constraint_map.get("metadata", {}).get("protected_facts", []),
+        "scenes": scenes,
         "audience": update.audience, "estimated_cost_usd": 0.02,
         "max_cost_usd": constraint_map.get("metadata", {}).get("max_cost_usd", 1.0),
     })
