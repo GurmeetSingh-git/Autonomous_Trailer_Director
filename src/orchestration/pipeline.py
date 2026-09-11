@@ -56,6 +56,15 @@ def default_story_map(episode: Path) -> dict[str, Any]:
     }
 
 
+def _default_transition_after(index: int, total: int) -> str:
+    """Positional trailer-pacing rule: a brief micropause early on, a fade
+    to black right before the final beat (title card), hard cuts elsewhere."""
+    if index >= total - 1:
+        return "hard_cut"          
+    if index == total - 2:
+        return "fade_to_black"     
+    return "micropause"            
+
 def build_plan(audience: str, story_map: dict[str, Any], constraint_map: dict[str, Any], log: DecisionLog) -> dict[str, Any]:
     """Build and validate one audience-specific trailer plan."""
     scenes = [scene for scene in story_map["scenes"] if scene.get("spoiler_level", "low") != "high"]
@@ -67,6 +76,7 @@ def build_plan(audience: str, story_map: dict[str, Any], constraint_map: dict[st
     else:
         selected = sorted(scenes, key=lambda scene: audience_scene_score(audience, scene), reverse=True)
     selected = sorted(selected[:3], key=lambda scene: scene.get("start", 0))
+    
     segments = [
         {
             "id": chr(ord("a") + index),
@@ -85,6 +95,7 @@ def build_plan(audience: str, story_map: dict[str, Any], constraint_map: dict[st
             "start": edit_start,
             "end": edit_end,
             "spoiler_level": scene["spoiler_level"],
+            "transition_after": _default_transition_after(index, len(selected)),
         }
         for index, scene in enumerate(selected)
         for edit_start, edit_end in [_audience_edit_range(audience, scene)]

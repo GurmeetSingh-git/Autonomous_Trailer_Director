@@ -63,6 +63,7 @@ export type PromiseBeat = {
   source_out: string;
   emotional_goal: string;
   included: boolean;
+  transition_after?: "hard_cut" | "micropause" | "fade_to_black";
 };
 
 export type PromiseArc = {

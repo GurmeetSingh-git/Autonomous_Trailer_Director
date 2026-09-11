@@ -160,6 +160,7 @@ class PromiseBeat(BaseModel):
     source_out: str
     emotional_goal: str
     included: bool = True
+    transition_after: str | None = None
 
 
 class PromiseArcUpdate(BaseModel):
@@ -175,6 +176,7 @@ class AudienceCandidate(BaseModel):
     source_in: str
     source_out: str
     emotional_goal: str
+    transition_after: str = "hard_cut"
 
 
 class AudienceCandidates(BaseModel):
@@ -195,6 +197,7 @@ class PlotBeatProposal(BaseModel):
     beat_name: str
     emotional_goal: str
     included: bool = True
+    transition_after: str = "hard_cut" 
 
 
 class PlotRevision(BaseModel):
@@ -316,15 +319,15 @@ async def create_run(
     }
     constraint_map = ConstraintEngine().build(StoryMap.model_validate(internal_story_map)).model_dump()
     log = DecisionLog()
-    plans = {name: build_plan(name, internal_story_map, constraint_map, log) for name in AUDIENCES}
     selected_audience = audience if audience in AUDIENCES else "family"
-    trailer = trailer_from_plan(run_id, plans[selected_audience], story_map["title"])
+    plan = build_plan(selected_audience, internal_story_map, constraint_map, log)
+    trailer = trailer_from_plan(run_id, plan, story_map["title"])
     runs[run_id] = {
         "story_map": story_map,
         "trailer": trailer,
-        "plans": plans,
+        "plans": {selected_audience: plan},
         "planning_story_map": internal_story_map,
-        "promise_arc": promise_arc_from_plan(plans[selected_audience]),
+        "promise_arc": promise_arc_from_plan(plan),
         "constraint_map": constraint_map,
         "decision_log": log.as_list(),
         "filename": safe_name,
@@ -392,11 +395,12 @@ serves the audience in emotional_goal.
         if scene["spoiler_level"] == "high" or start < scene["start"] or end > scene["end"] or end <= start:
             continue
         segments.append({
-            "source_in": start, "source_out": end, "video": scene["id"], "audio": "original_dialogue",
-            "subtitle": "source_subtitles", "tone": scene.get("tone") or "discovery", "sensitive_content": scene.get("sensitive_content", []),
-            "reason": candidate.emotional_goal, "evidence": [f"scene:{scene['id']}", "human:audience_reanalysis"], "risk_flags": [],
-            "scene_id": scene["id"], "start": start, "end": end, "spoiler_level": scene["spoiler_level"],
-        })
+    "source_in": start, "source_out": end, "video": scene["id"], "audio": "original_dialogue",
+    "subtitle": "source_subtitles", "tone": scene.get("tone") or "discovery", "sensitive_content": scene.get("sensitive_content", []),
+    "reason": candidate.emotional_goal, "evidence": [f"scene:{scene['id']}", "human:audience_reanalysis"], "risk_flags": [],
+    "scene_id": scene["id"], "start": start, "end": end, "spoiler_level": scene["spoiler_level"],
+    "transition_after": candidate.transition_after,
+})
     if not segments:
         raise ValueError("The model returned no valid audience-grounded moments.")
     segments.sort(key=lambda item: item["start"])
@@ -429,6 +433,7 @@ def promise_arc_from_plan(plan: dict, feedback: str = "") -> dict:
                 "source_out": format_editable_timecode(segment["end"]),
                 "emotional_goal": segment["reason"],
                 "included": True,
+                "transition_after": segment.get("transition_after", "hard_cut"),
             }
             for index, segment in enumerate(plan["segments"])
         ],
@@ -525,6 +530,7 @@ def trailer_from_plan(run_id: str, plan: dict, title: str) -> dict:
                     "checks": validation.get("checks", []),
                 },
                 "is_included": segment.get("is_included", True),
+                "transition_after": segment.get("transition_after", "hard_cut"),
             }
             for index, segment in enumerate(plan["segments"])
         ],
@@ -576,28 +582,82 @@ def render_segments_with_opencv(segments: list[dict], media_path: Path, output_p
     return output_path
 
 
+def _black_clip(path: Path, duration: float, reference_clip: Path) -> None:
+    """Generate a silent black clip matching the reference clip's resolution/fps."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise FileNotFoundError("ffprobe is not installed")
+    probe = subprocess.run(
+        [
+            ffprobe, "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,r_frame_rate",
+            "-of", "csv=p=0", str(reference_clip),
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    width, height, framerate = probe.stdout.strip().split(",")
+    subprocess.run(
+        [
+            shutil.which("ffmpeg"), "-y",
+            "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={framerate}:d={duration}",
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+            "-t", str(duration),
+            "-c:v", "libx264", "-c:a", "aac", "-ar", "48000",
+            str(path),
+        ],
+        check=True, capture_output=True, text=True,
+    )
+
+
 def render_segments_with_ffmpeg(segments: list[dict], media_path: Path, output_path: Path) -> Path:
-    """Cut and concatenate source ranges while preserving the audio track."""
+    """Cut and concatenate source ranges, inserting micropauses and fades between beats."""
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise FileNotFoundError("FFmpeg is not installed")
+
+    MICROPAUSE_DURATION = 0.3
+    FADE_DURATION = 0.6
+    BLACK_HOLD_DURATION = 0.4
+
     with tempfile.TemporaryDirectory(prefix="trailer-render-") as temporary_dir:
         temporary_path = Path(temporary_dir)
-        clip_paths = []
+        clip_paths: list[Path] = []
+
         for index, segment in enumerate(segments):
             clip_path = temporary_path / f"clip-{index}.mp4"
-            subprocess.run(
-                [
-                    ffmpeg, "-y", "-ss", str(segment["start"]), "-to", str(segment["end"]),
-                    "-i", str(media_path), "-map", "0:v:0", "-map", "0:a?",
-                    "-c:v", "libx264", "-c:a", "aac", "-ar", "48000", "-avoid_negative_ts", "make_zero",
-                    str(clip_path),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+            start_val = parse_timecode(segment["start"]) if isinstance(segment["start"], str) else segment["start"]
+            end_val = parse_timecode(segment["end"]) if isinstance(segment["end"], str) else segment["end"]
+            duration = end_val - start_val
+            transition = segment.get("transition_after", "hard_cut")
+
+            video_filters = []
+            audio_filters = []
+            if transition == "fade_to_black":
+                fade_start = max(0.0, duration - FADE_DURATION)
+                video_filters.append(f"fade=t=out:st={fade_start}:d={FADE_DURATION}")
+                audio_filters.append(f"afade=t=out:st={fade_start}:d={FADE_DURATION}")
+
+            cmd = [
+                ffmpeg, "-y", "-ss", str(start_val), "-to", str(end_val),
+                "-i", str(media_path), "-map", "0:v:0", "-map", "0:a?",
+            ]
+            if video_filters:
+                cmd += ["-vf", ",".join(video_filters)]
+            if audio_filters:
+                cmd += ["-af", ",".join(audio_filters)]
+            cmd += [
+                "-c:v", "libx264", "-c:a", "aac", "-ar", "48000", "-avoid_negative_ts", "make_zero",
+                str(clip_path),
+            ]
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
             clip_paths.append(clip_path)
+
+            if index < len(segments) - 1 and transition in ("micropause", "fade_to_black"):
+                black_path = temporary_path / f"black-{index}.mp4"
+                gap_duration = MICROPAUSE_DURATION if transition == "micropause" else BLACK_HOLD_DURATION
+                _black_clip(black_path, gap_duration, clip_path)
+                clip_paths.append(black_path)
+
         concat_list = temporary_path / "concat.txt"
         concat_list.write_text("\n".join(f"file '{path.as_posix()}'" for path in clip_paths), encoding="utf-8")
         subprocess.run(
@@ -671,6 +731,13 @@ make the plan match that direction while keeping the best beats that still serve
 _the audience promise_. Use only the supplied scene IDs and exclude high-spoiler scenes.
 Preserve useful beats when the feedback does not explicitly ask to remove them.
 Return only story beats, not clip timecodes or editing instructions.
+
+For each beat, also choose transition_after — the cut style leading INTO the next
+beat: "hard_cut" for a direct, punchy cut; "micropause" for a brief beat of black
+that lets a moment land before the next clip; "fade_to_black" for a slower fade
+used sparingly, typically right before a major emotional turn or the final beat.
+Use hard_cut for most transitions; reserve micropause and fade_to_black for
+moments that earn them.
 """
             revision = LLMClient(mode="live").generate_structured(
                 system_prompt=prompt,
@@ -694,13 +761,14 @@ Return only story beats, not clip timecodes or editing instructions.
                 start = float(scene.get("trailer_start", scene.get("start", 0)))
                 end = float(scene.get("trailer_end", scene.get("end", start + 15)))
                 segments.append({
-                    "source_in": start, "source_out": end, "video": scene["id"],
-                    "label": proposal.beat_name, "audio": "original_dialogue", "subtitle": "source_subtitles",
-                    "tone": scene.get("tone") or scene.get("emotion") or "discovery", "sensitive_content": scene.get("sensitive_content", []),
-                    "reason": proposal.emotional_goal, "evidence": [f"scene:{scene['id']}", "human:plot_feedback", "llm:plot_revision"],
-                    "risk_flags": [], "scene_id": scene["id"], "start": start, "end": end,
-                    "spoiler_level": scene.get("spoiler_level", "low"),
-                })
+                "source_in": start, "source_out": end, "video": scene["id"],
+                "label": proposal.beat_name, "audio": "original_dialogue", "subtitle": "source_subtitles",
+                "tone": scene.get("tone") or scene.get("emotion") or "discovery", "sensitive_content": scene.get("sensitive_content", []),
+                "reason": proposal.emotional_goal, "evidence": [f"scene:{scene['id']}", "human:plot_feedback", "llm:plot_revision"],
+                "risk_flags": [], "scene_id": scene["id"], "start": start, "end": end,
+                "spoiler_level": scene.get("spoiler_level", "low"),
+                "transition_after": proposal.transition_after,
+            })
             if segments:
                 plan = deepcopy(current_plan)
                 plan.update({"audience_promise": revision.audience_promise, "segments": segments, "duration_seconds": sum(item["end"] - item["start"] for item in segments)})
@@ -774,7 +842,9 @@ def review_trailer(run_id: str, review: ReviewRequest) -> dict:
         run["review_status"] = "NEEDS_REVISION"
         run["review_feedback"] = feedback
     else:
-        plan = run["plans"].get(run["trailer"]["audience"], run["plans"]["family"])
+        plan = run["plans"].get(run["trailer"]["audience"])
+        if plan is None:
+            plan = build_plan(run["trailer"]["audience"], planning_story_map(run), run["constraint_map"], DecisionLog())
         result = regenerate_review({
             "audience": plan["audience"],
             "story_map": planning_story_map(run),
@@ -831,7 +901,12 @@ def get_promise_arc(run_id: str, audience: str | None = None, reanalyze: bool = 
         if "audience" in promise_arc:
             return promise_arc
     audience = run.get("trailer", {}).get("audience", "family")
-    return promise_arc_from_plan(run["plans"].get(audience, run["plans"]["family"]))
+    plan = run["plans"].get(audience)
+    if plan is None:
+        plan = build_plan(audience, planning_story_map(run), run["constraint_map"], DecisionLog())
+        run.setdefault("plans", {})[audience] = plan
+        save_runs()
+    return promise_arc_from_plan(plan)
 
 
 @app.post("/runs/{run_id}/promise-arc")
@@ -860,10 +935,14 @@ def update_promise_arc(run_id: str, update: PromiseArcUpdate) -> dict:
             "reason": f"{beat.emotional_goal}{f' Reviewer note: {update.feedback.strip()}' if update.feedback.strip() else ''}", "evidence": [f"scene:{beat.scene_id}", "human:promise_arc_edit", *(["human:plot_feedback"] if update.feedback.strip() else [])],
             "risk_flags": [], "scene_id": beat.scene_id, "start": source_in, "end": source_out,
             "spoiler_level": scene.get("spoilerLevel", scene.get("spoiler_level", "low")),
+            "transition_after": beat.transition_after or "",
         })
     segments.sort(key=lambda item: item["start"])
     if not segments:
         raise HTTPException(status_code=422, detail="Include at least one narrative beat before regenerating the timeline.")
+    for index, segment in enumerate(segments):
+        if segment["transition_after"] not in {"hard_cut", "micropause", "fade_to_black"}:
+            segment["transition_after"] = _default_transition_after(index, len(segments))
     constraint_map = run["constraint_map"]
     validation = Validator().validate(segments, {
         "scene_ids": constraint_map.get("metadata", {}).get("scene_ids", []),
@@ -874,7 +953,9 @@ def update_promise_arc(run_id: str, update: PromiseArcUpdate) -> dict:
         "audience": update.audience, "estimated_cost_usd": 0.02,
         "max_cost_usd": constraint_map.get("metadata", {}).get("max_cost_usd", 1.0),
     })
-    plan = deepcopy(run["plans"].get(update.audience, run["plans"]["family"]))
+    plan = deepcopy(run["plans"].get(update.audience))
+    if plan is None:
+        plan = build_plan(update.audience, planning_story_map(run), constraint_map, DecisionLog())
     plan.update({"audience": update.audience, "audience_promise": update.audience_promise, "segments": segments,
                  "duration_seconds": sum(item["end"] - item["start"] for item in segments), "validation": validation})
     run["plans"][update.audience] = plan
