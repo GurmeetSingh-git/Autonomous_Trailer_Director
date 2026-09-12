@@ -25,7 +25,8 @@ from src.orchestration.pipeline import AUDIENCES, build_plan
 from src.planning.audience_strategy import AUDIENCE_GOALS
 from src.verification.validator import Validator
 from src.orchestration.review_graph import regenerate_review
-
+from src.ingestion.scene_detector import detect_scene_cuts, snap_scene_to_cuts
+from src.orchestration.pipeline import AUDIENCES, build_plan, default_transition_after
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -242,32 +243,62 @@ def save_supporting_upload(upload: UploadFile | None, run_id: str, label: str) -
     return result
 
 
+
 @app.post("/runs")
 async def create_run(
     episode: UploadFile = File(...),
     audience: str = Form("family"),
     model: str = Form(""),
     scene_descriptions: UploadFile | None = File(None),
-    dialogue_subtitles: UploadFile | None = File(None),
+    scene_subtitles: UploadFile | None = File(None),
     policies_metadata: UploadFile | None = File(None),
 ) -> dict[str, str]:
     run_id = str(uuid4())
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     safe_name = Path(episode.filename or "episode.mp4").name
     video_path = UPLOAD_DIR / f"{run_id}_{safe_name}"
+
     with video_path.open("wb") as destination:
         shutil.copyfileobj(episode.file, destination)
     logger.info("Saved uploaded episode %s (%d bytes)", safe_name, video_path.stat().st_size)
+
+    # ==========================================
+    # 🎵 PIPELINE 1: Extract Audio for LLM Dialogue & Timestamps
+    # ==========================================
+    audio_path = UPLOAD_DIR / f"{run_id}_extracted_audio.wav"
+    try:
+        audio_cmd = [
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+            str(audio_path)
+        ]
+        subprocess.run(audio_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        logger.info("Successfully extracted audio track to %s", audio_path)
+    except subprocess.CalledProcessError as e:
+        logger.warning("Audio extraction failed: %s", e)
+
+    if not audio_path.is_file() or audio_path.stat().st_size == 0:
+        video_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail="Audio extraction failed; cannot analyze episode without audio.")
+
+    # ==========================================
+    # 👁️ PIPELINE 2: PySceneDetect for Visual Scene Cuts
+    # ==========================================
+    try:
+        detected_scenes = detect_scene_cuts(str(video_path))
+        logger.info("PySceneDetect found %d visual boundaries.", len(detected_scenes))
+    except Exception as e:
+        logger.warning("PySceneDetect processing failed: %s", e)
+        detected_scenes = []
+
     supporting_files = {
         "scene_descriptions": save_supporting_upload(scene_descriptions, run_id, "scenes"),
-        "dialogue_subtitles": save_supporting_upload(dialogue_subtitles, run_id, "dialogue"),
+        "dialogue_subtitles": save_supporting_upload(scene_subtitles, run_id, "dialogue"),
         "policies_metadata": save_supporting_upload(policies_metadata, run_id, "policies"),
+        "extracted_audio": {"filename": audio_path.name, "path": str(audio_path)},
+        "pyscenedetect_cuts": detected_scenes
     }
-    evidence_context = {
-        key: {field: value for field, value in (item or {}).items() if field != "path"}
-        for key, item in supporting_files.items()
-        if item
-    }
+
     selected_model = model or os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
     if not selected_model.startswith("gemini-"):
         video_path.unlink(missing_ok=True)
@@ -277,17 +308,30 @@ async def create_run(
         llm = LLMClient(mode="live")
         generated = llm.generate_structured(
             system_prompt=STORY_MAP_PROMPT,
-            media=str(video_path),
-            context={"audience": audience, "filename": safe_name, "supporting_evidence": evidence_context},
+            media=str(audio_path),
+            context={"audience": audience, "filename": safe_name, "supporting_evidence": supporting_files},
             response_schema=GeneratedStoryMap,
             cache_key=run_id,
             model=selected_model,
         )
+        print(f"\n=== GEMINI STORY MAP (from audio: {audio_path.name}) ===")
+        print(f"Title: {generated.title}")
+        print(f"Logline: {generated.logline}")
+        print(f"Spoiler budget: {generated.spoiler_budget}")
+        for scene in generated.scenes:
+            print(f"  [{scene.id}] {scene.timecode}–{scene.end_timecode} | {scene.tone}/{scene.emotion} | {scene.description}")
+        print("=== END STORY MAP ===\n")
         logger.info("Gemini raw scenes: %s", [scene.model_dump() for scene in generated.scenes])
     except Exception as exc:
         video_path.unlink(missing_ok=True)
         logger.exception("Episode analysis failed for run %s", run_id)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    normalized_scenes = normalize_scenes(generated.scenes, video_path)
+    normalized_scenes = [
+        snap_scene_to_cuts(scene, detected_scenes, max_drift_seconds=2.0)
+        for scene in normalized_scenes
+    ]
 
     story_map = {
         "title": generated.title,
@@ -297,7 +341,7 @@ async def create_run(
             {"name": character.name, "role": character.role, "color": color}
             for color, character in zip(("coral", "sky", "gold"), generated.characters)
         ],
-        "scenes": normalize_scenes(generated.scenes, video_path),
+        "scenes": normalized_scenes,
     }
     internal_story_map = {
         **story_map,
@@ -942,7 +986,7 @@ def update_promise_arc(run_id: str, update: PromiseArcUpdate) -> dict:
         raise HTTPException(status_code=422, detail="Include at least one narrative beat before regenerating the timeline.")
     for index, segment in enumerate(segments):
         if segment["transition_after"] not in {"hard_cut", "micropause", "fade_to_black"}:
-            segment["transition_after"] = _default_transition_after(index, len(segments))
+            segment["transition_after"] = default_transition_after(index, len(segments))
     constraint_map = run["constraint_map"]
     validation = Validator().validate(segments, {
         "scene_ids": constraint_map.get("metadata", {}).get("scene_ids", []),
@@ -989,3 +1033,8 @@ def download_rendered_trailer(run_id: str) -> FileResponse:
     if not output_path.is_file():
         output_path = render_segments(run_id, get_run(run_id))
     return FileResponse(output_path, media_type="video/mp4", filename=f"{run_id}-trailer.mp4")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
