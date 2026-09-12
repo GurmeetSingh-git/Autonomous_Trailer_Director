@@ -969,8 +969,13 @@ def update_promise_arc(run_id: str, update: PromiseArcUpdate) -> dict:
             raise HTTPException(status_code=422, detail=f"Unknown scene: {beat.scene_id}")
         source_in = parse_timecode(beat.source_in)
         source_out = parse_timecode(beat.source_out)
-        if source_in < scene["start"] or source_out > scene["end"] or source_out <= source_in:
+        scene_start = float(scene["start"])
+        scene_end = float(scene["end"])
+        rounding_tolerance = 0.05
+        if source_in < scene_start - rounding_tolerance or source_out > scene_end + rounding_tolerance or source_out <= source_in:
             raise HTTPException(status_code=422, detail=f"Invalid range for {beat.scene_id}; it must stay inside the source scene.")
+        source_in = max(scene_start, source_in)
+        source_out = min(scene_end, source_out)
         segments.append({
             "source_in": source_in, "source_out": source_out, "video": beat.scene_id,
             "label": beat.beat_name,
