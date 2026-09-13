@@ -21,13 +21,14 @@ from src.llm.client import LLMClient
 from src.models.story_map import StoryMap
 from src.constraints.constraint_engine import ConstraintEngine
 from src.logging.decision_log import DecisionLog
-from src.orchestration.pipeline import AUDIENCES, build_plan
 from src.planning.audience_strategy import AUDIENCE_GOALS
 from src.verification.validator import Validator
 from src.orchestration.review_graph import regenerate_review
 from src.ingestion.scene_detector import detect_scene_cuts, snap_scene_to_cuts
 from src.orchestration.pipeline import AUDIENCES, build_plan, default_transition_after
-
+from src.ingestion.transcribe import transcribe_audio
+from src.ingestion.shot_records import build_shot_records
+from src.ingestion.vision_pass import run_vision_pass, group_shots_for_vision
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,7 @@ def planning_story_map(run: dict) -> dict:
                 "trailer_start": scene.get("trailerStart", scene.get("start", 0)),
                 "trailer_end": scene.get("trailerEnd", scene.get("end", 0)),
                 "sensitive_content": scene.get("sensitiveContent", []),
+                "source_shots": scene.get("sourceShots", scene.get("source_shots", [])),
             }
             for scene in story_map.get("scenes", [])
         ],
@@ -144,6 +146,7 @@ class StoryScene(BaseModel):
     tone: str = ""
     sensitive_content: list[str] = Field(default_factory=list)
     spoiler_level: str = "low"
+    source_shots: list[str] = Field(default_factory=list)
 
 
 class GeneratedStoryMap(BaseModel):
@@ -207,21 +210,39 @@ class PlotRevision(BaseModel):
 
 
 STORY_MAP_PROMPT = """
-Analyze the uploaded episode video and produce a spoiler-aware story map.
-Use only events, characters, and dialogue visible or audible in the video.
-Keep scene descriptions concise and do not invent names when they are unknown.
-Break the episode into 4 to 8 distinct chronological story beats whenever the
-video supports them; do not merge the whole episode into only one or two broad
-scenes. Return each beat with start timecode and end_timecode in HH:MM:SS format.
-Also return content_start_timecode and content_end_timecode for the shortest
-self-contained trailer-worthy beat in that scene, normally 10 to 15 seconds.
-These content timecodes must be inside the scene boundaries and grounded in
-visible action or spoken dialogue; do not choose them by duration alone. Mark spoiler_level
-as low, medium, or high. The spoiler_budget is the maximum percentage of the
-episode that can be revealed without giving away the ending; choose a sensible
-value between 10 and 30.
-Also classify each beat with an emotion and concise tone such as wonder,
-tension, stakes, humour, discovery, or calm.
+Analyze the provided shot-level evidence (shot_evidence) and produce a
+spoiler-aware story map. Do not use raw video or audio directly — reason
+only over the structured evidence given to you.
+
+Each item in shot_evidence has a shot_id, start/end time in seconds, an
+audio field (dialogue and non-verbal events), and — where visual_needed is
+true — a visual field describing characters, appearance, actions, location,
+and objects confirmed by inspecting actual video frames.
+
+Use VISUAL evidence as the source of truth for actions, locations,
+characters, non-dialogue moments, establishing shots, and emotional visual
+beats, especially for shots with little or no dialogue. Use AUDIO evidence
+(dialogue) as the source of truth for spoken lines, narration, and factual
+claims made aloud. Do not invent events, characters, or resolutions absent
+from the evidence. If audio and visual evidence for a shot seem to
+disagree, describe both rather than resolving the disagreement yourself.
+
+Group shots into 4 to 8 distinct chronological story beats; do not merge
+the whole episode into one or two broad scenes. For each scene return:
+- start timecode and end_timecode in HH:MM:SS, spanning its shots
+- source_shots: the shot_id values from shot_evidence this scene is built
+  from — every scene must be grounded in real shot_ids; never invent one
+- content_start_timecode and content_end_timecode for the shortest
+  self-contained trailer-worthy beat, normally 10-15 seconds, inside the
+  scene boundaries and inside the referenced shots, grounded in visible
+  action or spoken dialogue, not chosen by duration alone
+- spoiler_level: low, medium, or high
+- an emotion and concise tone such as wonder, tension, stakes, humour,
+  discovery, or calm
+
+Keep descriptions concise; don't invent names when unknown. spoiler_budget
+is the max percentage of the episode revealable without spoiling the
+ending — choose a sensible value between 10 and 30.
 """
 
 
@@ -304,17 +325,77 @@ async def create_run(
         video_path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="Invalid Gemini model selection.")
 
+    # ==========================================
+    # 🗣️ PIPELINE 3: Fine-grained transcript for shot-level grounding
+    # ==========================================
+    llm = LLMClient(mode="live")
+    selected_model = model or os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
     try:
-        llm = LLMClient(mode="live")
+        audio_events = transcribe_audio(str(audio_path), llm, cache_key=run_id, model=selected_model)
+        logger.info("Transcribed %d fine-grained audio segments.", len(audio_events))
+    except Exception as e:
+        logger.warning("Transcription failed: %s", e)
+        audio_events = []
+
+    shot_records = build_shot_records(detected_scenes, audio_events)
+    
+    # DEBUG: full JSON before visual verification
+    print("\n=== SHOT RECORDS (before vision pass) ===")
+    print(json.dumps([r.model_dump() for r in shot_records], indent=2, default=str))
+    print("=== END (before) ===\n")
+    
+    
+    # DEBUG: preview grouping before any vision LLM calls happen
+    preview_groups = group_shots_for_vision(shot_records)
+    flagged_shot_count = sum(shot.visual_needed for shot in shot_records)
+    calls_without_grouping = flagged_shot_count
+    calls_with_grouping = sum(
+        1 for group in preview_groups
+        if len(group) > 1 or group[0].visual_needed
+    )
+    print("\n=== VISION GROUPING PREVIEW (no LLM calls made yet) ===")
+    for group in preview_groups:
+        if len(group) > 1:
+            print(f"  GROUP: {group[0].shot_id}-{group[-1].shot_id} "
+                f"({len(group)} shots, {group[0].start:.1f}s-{group[-1].end:.1f}s) -> 1 call")
+        elif group[0].visual_needed:
+            print(f"  SINGLE: {group[0].shot_id} (has dialogue, flagged) -> 1 call")
+    print(f"Flagged shots: {flagged_shot_count}")
+    print(f"Calls WITHOUT grouping: {calls_without_grouping}")
+    print(f"Calls WITH grouping: {calls_with_grouping}")
+    print(f"Calls saved: {calls_without_grouping - calls_with_grouping}")
+    print("=== END GROUPING PREVIEW ===\n")
+    
+    
+    shot_records = run_vision_pass(shot_records, str(video_path), llm, model=selected_model)
+    
+    # DEBUG: full JSON after visual verification
+    print("\n=== SHOT RECORDS (after vision pass) ===")
+    print(json.dumps([r.model_dump() for r in shot_records], indent=2, default=str))
+    print("=== END (after) ===\n")
+    
+    logger.info(
+        "Built %d shot records; %d flagged for visual inspection.",
+        len(shot_records),
+        sum(record.visual_needed for record in shot_records),
+    )
+    shot_evidence = [record.model_dump() for record in shot_records]
+    try:
         generated = llm.generate_structured(
             system_prompt=STORY_MAP_PROMPT,
-            media=str(audio_path),
-            context={"audience": audience, "filename": safe_name, "supporting_evidence": supporting_files},
+            media=None,
+            context={
+                "audience": audience,
+                "filename": safe_name,
+                "supporting_evidence": supporting_files,
+                "shot_evidence": shot_evidence,
+            },
             response_schema=GeneratedStoryMap,
             cache_key=run_id,
             model=selected_model,
         )
-        print(f"\n=== GEMINI STORY MAP (from audio: {audio_path.name}) ===")
+        print("\n=== GEMINI STORY MAP (from shot-level evidence) ===")
         print(f"Title: {generated.title}")
         print(f"Logline: {generated.logline}")
         print(f"Spoiler budget: {generated.spoiler_budget}")
@@ -357,6 +438,7 @@ async def create_run(
                 "emotion": scene.get("emotion", ""),
                 "tone": scene.get("tone", ""),
                 "sensitive_content": scene.get("sensitiveContent", []),
+                "source_shots": scene.get("sourceShots", []),
             }
             for scene in story_map["scenes"]
         ],
@@ -377,6 +459,7 @@ async def create_run(
         "filename": safe_name,
         "video_path": str(video_path),
         "supporting_files": supporting_files,
+        "shot_records": [record.model_dump() for record in shot_records],   # ADD THIS
         "review_status": "PENDING",
         "review_feedback": "",
         "review_round": 0,
@@ -384,6 +467,27 @@ async def create_run(
     save_runs()
     return {"runId": run_id}
 
+
+def resolve_render_range(segment: dict, shot_records_by_id: dict[str, dict]) -> tuple[float, float]:
+    """Snap a segment's render range onto exact shot boundaries.
+
+    Only source_shots that overlap the already-selected start/end window
+    are used, so a scene's full shot list (which may span more than the
+    chosen trailer sub-range) doesn't silently widen the clip.
+    """
+    fallback_start = parse_timecode(segment["start"]) if isinstance(segment["start"], str) else segment["start"]
+    fallback_end = parse_timecode(segment["end"]) if isinstance(segment["end"], str) else segment["end"]
+    shot_ids = segment.get("source_shots") or []
+    overlapping = [
+        shot_records_by_id[shot_id]
+        for shot_id in shot_ids
+        if shot_id in shot_records_by_id
+        and shot_records_by_id[shot_id]["end"] > fallback_start
+        and shot_records_by_id[shot_id]["start"] < fallback_end
+    ]
+    if not overlapping:
+        return fallback_start, fallback_end
+    return min(s["start"] for s in overlapping), max(s["end"] for s in overlapping)
 
 def parse_timecode(value: str) -> float:
     hours, minutes, seconds = value.split(":")
@@ -404,25 +508,37 @@ def format_editable_timecode(value: float) -> str:
 
 
 def reanalyze_audience_plan(run_id: str, run: dict, audience: str) -> dict:
-    """Ask the media model for fresh, audience-grounded source moments."""
+    """Ask the model for fresh, audience-grounded moments from shot evidence."""
     story_map = planning_story_map(run)
     model = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+    shot_records = run.get("shot_records", [])
+    shot_ids_by_scene = {scene["id"]: set(scene.get("source_shots", [])) for scene in story_map["scenes"]}
     context = {
         "audience": audience,
         "audience_goal": AUDIENCE_GOALS[audience],
-        "scenes": [{key: scene.get(key) for key in ("id", "start", "end", "description", "emotion", "tone", "characters", "spoiler_level")} for scene in story_map["scenes"]],
+        "scenes": [
+            {
+                **{key: scene.get(key) for key in ("id", "start", "end", "description", "emotion", "tone", "characters", "spoiler_level")},
+                "shot_evidence": [
+                    shot for shot in shot_records
+                    if shot["shot_id"] in shot_ids_by_scene.get(scene["id"], set())
+                ],
+            }
+            for scene in story_map["scenes"]
+        ],
     }
     prompt = """
-Review the uploaded video again for the requested audience. Select up to three
-non-spoiler moments that best serve the audience goal. Return only moments
-that visibly or audibly occur in the video and inside the supplied scene
-boundaries. Use precise HH:MM:SS.ss timecodes. Prefer different moments when
-the audience goal calls for a different emphasis. Explain why each moment
+Review the shot_evidence attached to each scene for the requested audience.
+Select up to three non-spoiler moments that best serve the audience goal.
+Ground every choice only in the audio and visual evidence already given —
+do not invent anything absent from it. Use precise HH:MM:SS.ss timecodes
+derived from the shot boundaries. Prefer different moments when the
+audience goal calls for a different emphasis. Explain why each moment
 serves the audience in emotional_goal.
 """
     result = LLMClient(mode="live").generate_structured(
         system_prompt=prompt,
-        media=run["video_path"],
+        media=None,
         context=context,
         response_schema=AudienceCandidates,
         cache_key=f"{run_id}-{audience}",
@@ -439,12 +555,14 @@ serves the audience in emotional_goal.
         if scene["spoiler_level"] == "high" or start < scene["start"] or end > scene["end"] or end <= start:
             continue
         segments.append({
-    "source_in": start, "source_out": end, "video": scene["id"], "audio": "original_dialogue",
-    "subtitle": "source_subtitles", "tone": scene.get("tone") or "discovery", "sensitive_content": scene.get("sensitive_content", []),
-    "reason": candidate.emotional_goal, "evidence": [f"scene:{scene['id']}", "human:audience_reanalysis"], "risk_flags": [],
-    "scene_id": scene["id"], "start": start, "end": end, "spoiler_level": scene["spoiler_level"],
-    "transition_after": candidate.transition_after,
-})
+        "source_in": start, "source_out": end, "video": scene["id"],
+        "label": scene.get("title", scene["id"]),
+        "audio": "original_dialogue",
+        "subtitle": "source_subtitles", "tone": scene.get("tone") or "discovery", "sensitive_content": scene.get("sensitive_content", []),
+        "reason": candidate.emotional_goal, "evidence": [f"scene:{scene['id']}", "human:audience_reanalysis"], "risk_flags": [],
+        "scene_id": scene["id"], "start": start, "end": end, "spoiler_level": scene["spoiler_level"],
+        "transition_after": candidate.transition_after,
+    })
     if not segments:
         raise ValueError("The model returned no valid audience-grounded moments.")
     segments.sort(key=lambda item: item["start"])
@@ -464,7 +582,6 @@ serves the audience in emotional_goal.
 
 def promise_arc_from_plan(plan: dict, feedback: str = "") -> dict:
     """Expose the intent that precedes clip selection in an editable form."""
-    beat_names = ("Introduction / Setup", "Conflict / Turning Point", "Resolution / Core Message")
     return {
         "audience": plan["audience"],
         "audience_profile": plan["audience"],
@@ -472,7 +589,7 @@ def promise_arc_from_plan(plan: dict, feedback: str = "") -> dict:
         "narrative_arc": [
             {
                 "scene_id": segment["scene_id"],
-                "beat_name": beat_names[index] if index < len(beat_names) else f"Story beat {index + 1}",
+                "beat_name": segment.get("label") or f"Story beat {index + 1}",
                 "source_in": format_editable_timecode(segment["start"]),
                 "source_out": format_editable_timecode(segment["end"]),
                 "emotional_goal": segment["reason"],
@@ -532,6 +649,7 @@ def normalize_scenes(scenes: list[StoryScene], video_path: Path) -> list[dict]:
             "tone": scene.tone,
             "sensitiveContent": scene.sensitive_content,
             "spoilerLevel": scene.spoiler_level,
+            "sourceShots": scene.source_shots,
             "selected": scene.spoiler_level != "high",
         })
     return normalized
@@ -575,6 +693,7 @@ def trailer_from_plan(run_id: str, plan: dict, title: str) -> dict:
                 },
                 "is_included": segment.get("is_included", True),
                 "transition_after": segment.get("transition_after", "hard_cut"),
+                 "source_shots": segment.get("source_shots", []),
             }
             for index, segment in enumerate(plan["segments"])
         ],
@@ -599,7 +718,7 @@ def get_media(run_id: str) -> FileResponse:
     return FileResponse(media_path)
 
 
-def render_segments_with_opencv(segments: list[dict], media_path: Path, output_path: Path) -> Path:
+def render_segments_with_opencv(segments: list[dict], media_path: Path, output_path: Path, shot_records_by_id: dict[str, dict] | None = None) -> Path:
     """Fallback renderer for local setups without an FFmpeg executable."""
     try:
         import cv2
@@ -611,8 +730,9 @@ def render_segments_with_opencv(segments: list[dict], media_path: Path, output_p
         if not capture.isOpened() or not writer.isOpened():
             raise RuntimeError("Unable to open source or output video")
         for segment in segments:
-            start_frame = max(0, int(parse_timecode(segment["start"]) * fps))
-            end_frame = max(start_frame, int(parse_timecode(segment["end"]) * fps))
+            start_val, end_val = resolve_render_range(segment, shot_records_by_id or {})
+            start_frame = max(0, int(start_val * fps))
+            end_frame = max(start_frame, int(end_val * fps))
             capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
             for _ in range(start_frame, end_frame):
                 success, frame = capture.read()
@@ -653,7 +773,7 @@ def _black_clip(path: Path, duration: float, reference_clip: Path) -> None:
     )
 
 
-def render_segments_with_ffmpeg(segments: list[dict], media_path: Path, output_path: Path) -> Path:
+def render_segments_with_ffmpeg(segments: list[dict], media_path: Path, output_path: Path, shot_records_by_id: dict[str, dict] | None = None) -> Path:
     """Cut and concatenate source ranges, inserting micropauses and fades between beats."""
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -669,8 +789,7 @@ def render_segments_with_ffmpeg(segments: list[dict], media_path: Path, output_p
 
         for index, segment in enumerate(segments):
             clip_path = temporary_path / f"clip-{index}.mp4"
-            start_val = parse_timecode(segment["start"]) if isinstance(segment["start"], str) else segment["start"]
-            end_val = parse_timecode(segment["end"]) if isinstance(segment["end"], str) else segment["end"]
+            start_val, end_val = resolve_render_range(segment, shot_records_by_id or {})
             duration = end_val - start_val
             transition = segment.get("transition_after", "hard_cut")
 
@@ -714,7 +833,6 @@ def render_segments_with_ffmpeg(segments: list[dict], media_path: Path, output_p
 
 
 def render_segments(run_id: str, run: dict) -> Path:
-    """Render the selected trailer segments into the run's output file."""
     media_path = Path(run.get("video_path", ""))
     if not media_path.is_file():
         raise HTTPException(status_code=404, detail="Uploaded media is no longer available")
@@ -723,13 +841,14 @@ def render_segments(run_id: str, run: dict) -> Path:
     segments = run.get("trailer", {}).get("segments", [])
     if not segments:
         raise HTTPException(status_code=422, detail="The trailer has no renderable segments.")
+    shot_records_by_id = {record["shot_id"]: record for record in run.get("shot_records", [])}
     if shutil.which("ffmpeg"):
         try:
-            return render_segments_with_ffmpeg(segments, media_path, output_path)
+            return render_segments_with_ffmpeg(segments, media_path, output_path, shot_records_by_id)
         except subprocess.CalledProcessError as exc:
             detail = exc.stderr.strip().splitlines()[-1] if exc.stderr else "FFmpeg could not render the trailer."
             raise HTTPException(status_code=503, detail=detail) from exc
-    return render_segments_with_opencv(segments, media_path, output_path)
+    return render_segments_with_opencv(segments, media_path, output_path, shot_records_by_id)
 
 
 def get_run(run_id: str) -> dict:
@@ -766,6 +885,7 @@ def reprocess_plot(run_id: str, request: PlotReprocessRequest, audience: str = "
         if os.environ.get("GEMINI_API_KEY"):
             current_plan = run.get("plans", {}).get(audience) or build_plan(audience, planning_story_map(run), run["constraint_map"], DecisionLog())
             scenes = planning_story_map(run).get("scenes", [])
+            shot_by_id = {shot["shot_id"]: shot for shot in run.get("shot_records", [])}
             prompt = """
 Revise the proposed trailer plot using the director's feedback as explicit instructions.
 Decide what to add, remove, reorder, rename, or rewrite.
@@ -774,7 +894,9 @@ Do not assume a rigid 3-beat limit; if the feedback asks for more or fewer beats
 make the plan match that direction while keeping the best beats that still serve
 _the audience promise_. Use only the supplied scene IDs and exclude high-spoiler scenes.
 Preserve useful beats when the feedback does not explicitly ask to remove them.
-Return only story beats, not clip timecodes or editing instructions.
+Ground every beat in the shot_evidence attached to its scene; do not invent
+content absent from that evidence. Return only story beats, not clip
+timecodes or editing instructions.
 
 For each beat, also choose transition_after — the cut style leading INTO the next
 beat: "hard_cut" for a direct, punchy cut; "micropause" for a brief beat of black
@@ -785,12 +907,25 @@ moments that earn them.
 """
             revision = LLMClient(mode="live").generate_structured(
                 system_prompt=prompt,
-                media=run["video_path"],
+                media=None,
                 context={
                     "audience": audience,
                     "director_feedback": feedback,
                     "current_plot": [{"scene_id": segment["scene_id"], "beat_name": segment.get("label", ""), "emotional_goal": segment.get("reason", "")} for segment in current_plan.get("segments", [])],
-                    "available_scenes": [{"id": scene["id"], "title": scene.get("title", ""), "description": scene.get("description", ""), "spoiler_level": scene.get("spoiler_level", "low")} for scene in scenes],
+                    "available_scenes": [
+                        {
+                            "id": scene["id"],
+                            "title": scene.get("title", ""),
+                            "description": scene.get("description", ""),
+                            "spoiler_level": scene.get("spoiler_level", "low"),
+                            "shot_evidence": [
+                                shot_by_id[shot_id]
+                                for shot_id in scene.get("source_shots", [])
+                                if shot_id in shot_by_id
+                            ],
+                        }
+                        for scene in scenes
+                    ],
                 },
                 response_schema=PlotRevision,
                 cache_key=f"{run_id}-plot-revision-{len(feedback)}",
@@ -985,6 +1120,7 @@ def update_promise_arc(run_id: str, update: PromiseArcUpdate) -> dict:
             "risk_flags": [], "scene_id": beat.scene_id, "start": source_in, "end": source_out,
             "spoiler_level": scene.get("spoilerLevel", scene.get("spoiler_level", "low")),
             "transition_after": beat.transition_after or "",
+            "source_shots": scene.get("sourceShots", scene.get("source_shots", [])),
         })
     segments.sort(key=lambda item: item["start"])
     if not segments:

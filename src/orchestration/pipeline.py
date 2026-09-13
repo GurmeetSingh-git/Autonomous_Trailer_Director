@@ -96,6 +96,7 @@ def build_plan(audience: str, story_map: dict[str, Any], constraint_map: dict[st
             "end": edit_end,
             "spoiler_level": scene["spoiler_level"],
             "transition_after": default_transition_after(index, len(selected)),
+            "source_shots": scene.get("source_shots", []),
         }
         for index, scene in enumerate(selected)
         for edit_start, edit_end in [_audience_edit_range(audience, scene)]
