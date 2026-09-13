@@ -123,6 +123,28 @@ export function getStoryMap(runId: string): Promise<StoryMap> {
   return request<StoryMap>(`/runs/${runId}/story-map`);
 }
 
+export function retryStoryMap(runId: string, model = ""): Promise<{ runId: string }> {
+  const body = new URLSearchParams();
+  if (model) body.set("model", model);
+  return fetch(`${API_URL}/runs/${runId}/story-map/retry`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  }).then(async (response) => {
+    if (!response.ok) {
+      let detail = "";
+      try {
+        const payload = await response.json() as { detail?: string };
+        detail = payload.detail ? `: ${payload.detail}` : "";
+      } catch {
+        // Keep the status error when the response is not JSON.
+      }
+      throw new Error(`Recovery failed: ${response.status}${detail}`);
+    }
+    return response.json() as Promise<{ runId: string }>;
+  });
+}
+
 export function getTrailer(runId: string): Promise<TrailerRun> {
   return request<TrailerRun>(`/runs/${runId}/trailer`);
 }
