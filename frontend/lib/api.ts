@@ -115,7 +115,16 @@ export async function uploadEpisode(file: File, audience: Audience, evidence: Ev
   if (evidence.dialogueSubtitles) body.append("dialogue_subtitles", evidence.dialogueSubtitles);
   if (evidence.policiesMetadata) body.append("policies_metadata", evidence.policiesMetadata);
   const response = await fetch(`${API_URL}/runs`, { method: "POST", body });
-  if (!response.ok) throw new Error(`Upload failed: ${response.status}`);
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const payload = await response.json() as { detail?: string };
+      detail = payload.detail ? `: ${payload.detail}` : "";
+    } catch {
+      // Keep the status error when the response is not JSON.
+    }
+    throw new Error(`Upload failed: ${response.status}${detail}`);
+  }
   return response.json() as Promise<{ runId: string }>;
 }
 

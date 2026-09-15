@@ -29,6 +29,9 @@ from src.orchestration.pipeline import AUDIENCES, build_plan, default_transition
 from src.ingestion.transcribe import transcribe_audio
 from src.ingestion.shot_records import build_shot_records
 from src.ingestion.vision_pass import run_vision_pass, group_shots_for_vision
+from src.rendering.text_overlays import build_drawtext_filter
+from src.rendering.text_overlays import clamp_card_duration
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -134,6 +137,15 @@ class StoryCharacter(BaseModel):
     role: str
 
 
+class TextCard(BaseModel):
+    content: str = ""
+    emphasis: str = "bold"          # subtle | bold | dramatic
+    position: str = "center"        # center | lower_third
+    case: str = "upper"             # upper | as_written
+    duration: float = 2.0           # seconds; clamped server-side
+    reason: str = ""
+
+
 class StoryScene(BaseModel):
     id: str
     title: str
@@ -148,6 +160,7 @@ class StoryScene(BaseModel):
     sensitive_content: list[str] = Field(default_factory=list)
     spoiler_level: str = "low"
     source_shots: list[str] = Field(default_factory=list)
+    text_card: TextCard | None = None 
 
 
 class GeneratedStoryMap(BaseModel):
@@ -167,6 +180,7 @@ class PromiseBeat(BaseModel):
     included: bool = True
     transition_after: str | None = None
     transition_reason: str = "" 
+    text_card: TextCard | None = None
 
 
 class PromiseArcUpdate(BaseModel):
@@ -206,6 +220,7 @@ class PlotBeatProposal(BaseModel):
     included: bool = True
     transition_after: str = "hard_cut" 
     transition_reason: str = ""    
+    text_card: TextCard | None = None 
 
 
 class PlotRevision(BaseModel):
@@ -247,6 +262,24 @@ the whole episode into one or two broad scenes. For each scene return:
 Keep descriptions concise; don't invent names when unknown. spoiler_budget
 is the max percentage of the episode revealable without spoiling the
 ending — choose a sensible value between 10 and 30.
+
+For any scene that would benefit from a standalone text card — an opening
+hook, a title-like statement, or a moment that needs a beat of silence and
+text rather than more footage — set text_card with:
+- content: a short punchy line (3-8 words), grounded only in the evidence
+  given; never invent plot facts, names, or dates not present in shot_evidence
+- emphasis: "dramatic" for a major turn, "bold" for a standard beat,
+  "subtle" for a quieter connective line
+- position: "center" for a standalone card, "lower_third" to overlay text
+  on the shot rather than replace it with black
+- duration: seconds the card should hold, between 1.2 and 3.5 — longer for
+  denser text, shorter for a single punchy line
+- reason: one sentence grounded in the evidence explaining why this card
+  earns its place
+
+Not every scene needs a card — leave text_card unset (null) for most scenes.
+Use judgment; two or three well-placed cards across the whole episode beat
+one on every scene.
 """
 
 
@@ -605,6 +638,7 @@ def promise_arc_from_plan(plan: dict, feedback: str = "") -> dict:
                 "included": True,
                 "transition_after": segment.get("transition_after", "hard_cut"),
                 "transition_reason": segment.get("transition_reason", ""),
+                "text_card": segment.get("text_card"),
             }
             for index, segment in enumerate(plan["segments"])
         ],
@@ -661,6 +695,7 @@ def normalize_scenes(scenes: list[StoryScene], video_path: Path) -> list[dict]:
             "spoilerLevel": scene.spoiler_level,
             "sourceShots": scene.source_shots,
             "selected": scene.spoiler_level != "high",
+            "textCard": scene.text_card.model_dump() if scene.text_card else None, 
         })
     return normalized
 
@@ -703,6 +738,7 @@ def trailer_from_plan(run_id: str, plan: dict, title: str) -> dict:
                 },
                 "is_included": segment.get("is_included", True),
                 "transition_after": segment.get("transition_after", "hard_cut"),
+                "text_card": segment.get("text_card"),
                 "transition_reason": segment.get("transition_reason", ""),
                 "source_shots": segment.get("source_shots", []),
             }
@@ -759,6 +795,7 @@ def _complete_run_from_story_map(
                 "trailer_end": scene.get("trailerEnd", scene["end"]),
                 "sensitive_content": scene.get("sensitiveContent", []),
                 "source_shots": scene.get("sourceShots", []),
+                "text_card": scene.get("textCard"), 
             }
             for scene in story_map["scenes"]
         ],
@@ -852,7 +889,30 @@ def _black_clip(path: Path, duration: float, reference_clip: Path) -> None:
         check=True, capture_output=True, text=True,
     )
 
-
+def _text_card(path: Path, card: dict, duration: float, reference_clip: Path) -> None:
+    ffprobe = shutil.which("ffprobe")
+    probe = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,r_frame_rate",
+         "-of", "csv=p=0", str(reference_clip)],
+        capture_output=True, text=True, check=True,
+    )
+    width, height, framerate = probe.stdout.strip().split(",")
+    text_filter = build_drawtext_filter(
+        card.get("content", ""), card.get("emphasis", "bold"),
+        card.get("position", "center"), card.get("case", "upper"), duration,
+    )
+    subprocess.run(
+        [shutil.which("ffmpeg"), "-y",
+         "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:r={framerate}:d={duration}",
+         "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+         "-t", str(duration),
+         "-vf", f"{text_filter},format=yuv420p,setsar=1",
+         "-c:v", "libx264", "-c:a", "aac", "-ar", "48000",
+         str(path)],
+        check=True, capture_output=True, text=True,
+    )
+    
 def _has_audio_stream(path: Path) -> bool:
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
@@ -909,12 +969,22 @@ def render_segments_with_ffmpeg(segments: list[dict], media_path: Path, output_p
     with tempfile.TemporaryDirectory(prefix="trailer-render-") as temporary_dir:
         temporary_path = Path(temporary_dir)
         segment_paths: list[Path] = []
+        path_transitions: list[str] = []
 
         for index, segment in enumerate(segments):
             clip_path = temporary_path / f"clip-{index}.mp4"
             start_val, end_val = resolve_render_range(segment, shot_records_by_id or {})
             duration = end_val - start_val
             transition = segment.get("transition_after", "hard_cut")
+            
+            card = segment.get("text_card")
+            if card:
+                card_path = temporary_path / f"card-{index}.mp4"
+                card_duration = clamp_card_duration(card.get("duration", 2.0))
+                # card needs a reference clip for resolution/fps; probe media_path directly
+                _text_card(card_path, card, card_duration, media_path)
+                segment_paths.append(card_path)
+                path_transitions.append("hard_cut")
 
             video_filters = []
             audio_filters = []
@@ -937,6 +1007,7 @@ def render_segments_with_ffmpeg(segments: list[dict], media_path: Path, output_p
             ]
             subprocess.run(cmd, check=True, capture_output=True, text=True)
             segment_paths.append(clip_path)
+            path_transitions.append(transition)
 
         final_paths: list[Path] = []
         for index, clip_path in enumerate(segment_paths):
@@ -944,7 +1015,7 @@ def render_segments_with_ffmpeg(segments: list[dict], media_path: Path, output_p
                 final_paths.append(clip_path)
                 continue
 
-            previous_transition = segments[index - 1].get("transition_after", "hard_cut")
+            previous_transition = path_transitions[index - 1]
             if previous_transition == "crossfade":
                 merged_path = temporary_path / f"crossfade-{index - 1}.mp4"
                 _crossfade_clip(final_paths[-1], clip_path, merged_path, FADE_DURATION)
@@ -1083,25 +1154,39 @@ Decide what to add, remove, reorder, rename, or rewrite.
 Follow the feedback exactly, even if it changes the number of story beats.
 Do not assume a rigid 3-beat limit; if the feedback asks for more or fewer beats,
 make the plan match that direction while keeping the best beats that still serve
-_the audience promise_. Use only the supplied scene IDs and exclude high-spoiler scenes.
+the audience promise. Use only the supplied scene IDs and exclude high-spoiler scenes.
 Preserve useful beats when the feedback does not explicitly ask to remove them.
 Ground every beat in the shot_evidence attached to its scene; do not invent
 content absent from that evidence. Return only story beats, not clip
 timecodes or editing instructions.
 
-For each beat, also choose transition_after — the cut style leading INTO the next
-beat: "hard_cut" for a direct punchy cut; "micropause" for a brief beat of black
-that lets a moment land; "fade_to_black" for a slower fade, used sparingly,
-typically right before a major emotional turn or the final beat; "crossfade"
-for a smooth blend between two visually or emotionally connected moments,
-without going through black. Use hard_cut for most transitions; reserve the
-others for moments that earn them.
+For each beat, also choose transition_after - the cut style leading INTO the next
+beat: "hard_cut" for a direct, punchy cut; "micropause" for a brief beat of black
+that lets a moment land before the next clip; "fade_to_black" for a slower fade
+used sparingly, typically right before a major emotional turn or the final beat;
+"crossfade" for a smooth blend between two visually or emotionally connected
+moments, without going through black. Use hard_cut for most transitions; reserve
+the others for moments that earn them.
 
-For every beat, also fill transition_reason with one concise sentence grounded
-in the shot_evidence of THIS beat and the next one — e.g. "Crossfade because
-both shots share the same lantern-lit hallway" or "Hard cut because the next
-beat jumps from calm to immediate danger." Never leave transition_reason empty
-and never invent evidence not present in shot_evidence.
+For every beat, fill transition_reason with one concise sentence grounded in the
+shot_evidence of this moment and the next one. Never leave transition_reason empty
+and never invent evidence not present in the shot_evidence.
+
+For any beat that would benefit from a standalone text card — an opening
+hook, a title-like statement, or a moment that needs a beat of silence and
+text rather than more footage — set text_card with:
+- content: a short punchy line (3-8 words), grounded only in the
+  shot_evidence attached to this beat; never invent plot facts, names, or
+  dates not present in the evidence
+- emphasis: "dramatic" for a major turn, "bold" for a standard beat,
+  "subtle" for a quieter connective line
+- position: "center" for a standalone card, "lower_third" to overlay text
+  on the shot rather than replace it with black
+- duration: seconds the card should hold, between 1.2 and 3.5
+- reason: one sentence grounded in the evidence explaining why this card
+  earns its place
+
+Not every beat needs a card — leave text_card unset (null) for most beats.
 """
             revision = LLMClient(mode="live").generate_structured(
                 system_prompt=prompt,
@@ -1144,8 +1229,12 @@ and never invent evidence not present in shot_evidence.
                 "reason": proposal.emotional_goal, "evidence": [f"scene:{scene['id']}", "human:plot_feedback", "llm:plot_revision"],
                 "risk_flags": [], "scene_id": scene["id"], "start": start, "end": end,
                 "spoiler_level": scene.get("spoiler_level", "low"),
-                "transition_after": proposal.transition_after,
-                "transition_reason": proposal.transition_reason,
+                "transition_after": getattr(proposal, "transition_after", "hard_cut"),
+                "transition_reason": getattr(proposal, "transition_reason", ""),
+                "text_card": (
+                    {**proposal.text_card.model_dump(), "duration": clamp_card_duration(proposal.text_card.duration)}
+                    if getattr(proposal, "text_card", None) else None
+            ),
             })
             if segments:
                 plan = deepcopy(current_plan)
@@ -1329,6 +1418,10 @@ def update_promise_arc(run_id: str, update: PromiseArcUpdate) -> dict:
             "transition_after": beat.transition_after or "hard_cut",
             "source_shots": scene.get("sourceShots", scene.get("source_shots", [])),
             "transition_reason": beat.transition_reason or "",
+            "text_card": (
+                {**beat.text_card.model_dump(), "duration": clamp_card_duration(beat.text_card.duration)}
+                if beat.text_card else None
+            ),
         })
     segments.sort(key=lambda item: item["start"])
     if not segments:
