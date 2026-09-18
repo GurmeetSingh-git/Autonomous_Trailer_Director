@@ -115,43 +115,12 @@ export async function uploadEpisode(file: File, audience: Audience, evidence: Ev
   if (evidence.dialogueSubtitles) body.append("dialogue_subtitles", evidence.dialogueSubtitles);
   if (evidence.policiesMetadata) body.append("policies_metadata", evidence.policiesMetadata);
   const response = await fetch(`${API_URL}/runs`, { method: "POST", body });
-  if (!response.ok) {
-    let detail = "";
-    try {
-      const payload = await response.json() as { detail?: string };
-      detail = payload.detail ? `: ${payload.detail}` : "";
-    } catch {
-      // Keep the status error when the response is not JSON.
-    }
-    throw new Error(`Upload failed: ${response.status}${detail}`);
-  }
+  if (!response.ok) throw new Error(`Upload failed: ${response.status}`);
   return response.json() as Promise<{ runId: string }>;
 }
 
 export function getStoryMap(runId: string): Promise<StoryMap> {
   return request<StoryMap>(`/runs/${runId}/story-map`);
-}
-
-export function retryStoryMap(runId: string, model = ""): Promise<{ runId: string }> {
-  const body = new URLSearchParams();
-  if (model) body.set("model", model);
-  return fetch(`${API_URL}/runs/${runId}/story-map/retry`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
-  }).then(async (response) => {
-    if (!response.ok) {
-      let detail = "";
-      try {
-        const payload = await response.json() as { detail?: string };
-        detail = payload.detail ? `: ${payload.detail}` : "";
-      } catch {
-        // Keep the status error when the response is not JSON.
-      }
-      throw new Error(`Recovery failed: ${response.status}${detail}`);
-    }
-    return response.json() as Promise<{ runId: string }>;
-  });
 }
 
 export function getTrailer(runId: string): Promise<TrailerRun> {
