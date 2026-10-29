@@ -70,6 +70,7 @@ export type PromiseArc = {
   audience: string;
   audience_profile: string;
   audience_promise: string;
+  target_duration_seconds?: number | null;
   narrative_arc: PromiseBeat[];
   validation_status: Validation["status"];
   feedback?: string;
@@ -80,7 +81,7 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, {
     ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
+    headers: init?.body instanceof FormData ? init.headers : { "Content-Type": "application/json", ...init?.headers },
   });
   if (!response.ok) {
     let detail = "";
@@ -107,16 +108,123 @@ export type EvidencePackage = {
   policiesMetadata?: File | null;
 };
 
-export async function uploadEpisode(file: File, audience: Audience, evidence: EvidencePackage = {}): Promise<{ runId: string }> {
+export type RunStatus = {
+  runId: string;
+  status: "processing" | "complete" | "failed";
+  stage: string;
+  error?: string | null;
+  canRecover: boolean;
+  progress?: { processed: number; total: number } | null;
+};
+
+export const runStageMessages: Record<string, string> = {
+  queued: "Episode uploaded. Preparing analysis...",
+  extracting_audio: "Extracting episode audio...",
+  detecting_scenes: "PySceneDetect is scanning the episode for scene cuts...",
+  transcribing_audio: "Transcribing dialogue in audio chunks...",
+  analyzing_visuals: "Analyzing representative frames from the episode...",
+  building_story_map: "Building the story map from the collected evidence...",
+};
+
+export type UploadProgress = {
+  stage: string;
+  message: string;
+  percentage?: number;
+};
+
+export function getRunStatus(runId: string): Promise<RunStatus> {
+  return request<RunStatus>(`/runs/${runId}/status`);
+}
+
+export function getRunProgress(status: RunStatus): UploadProgress {
+  const visualProgress = status.stage === "analyzing_visuals" ? status.progress : null;
+  if (visualProgress && visualProgress.total > 0) {
+    const percentage = Math.floor((visualProgress.processed / visualProgress.total) * 100);
+    return {
+      stage: status.stage,
+      message: `Checking visual evidence: ${visualProgress.processed}/${visualProgress.total} shots`,
+      percentage,
+    };
+  }
+  return {
+    stage: status.stage,
+    message: runStageMessages[status.stage] ?? "Analyzing episode...",
+  };
+}
+
+async function waitForRun(runId: string, onProgress?: (progress: UploadProgress) => void): Promise<void> {
+  while (true) {
+    const status = await getRunStatus(runId);
+    if (status.status === "complete") return;
+    if (status.status === "failed") {
+      const recoveryHint = status.canRecover ? ` [recoverableRunId=${runId}]` : "";
+      throw new Error(`${status.error || "Episode analysis failed."}${recoveryHint}`);
+    }
+    onProgress?.(getRunProgress(status));
+    await new Promise((resolve) => window.setTimeout(resolve, 2000));
+  }
+}
+
+function uploadEpisodeFile(body: FormData, onProgress?: (progress: UploadProgress) => void): Promise<{ runId: string }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API_URL}/runs`);
+    xhr.upload.addEventListener("progress", (event) => {
+      if (!event.lengthComputable) return;
+      const percentage = Math.round((event.loaded / event.total) * 100);
+      onProgress?.({
+        stage: "uploading",
+        message: percentage === 100 ? "Upload complete. Starting episode analysis..." : "Uploading episode...",
+        percentage,
+      });
+    });
+    xhr.addEventListener("error", () => reject(new Error("Upload failed. Check that the API is running and try again.")));
+    xhr.addEventListener("load", () => {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        let detail = "";
+        try {
+          const response = JSON.parse(xhr.responseText) as { detail?: string };
+          detail = response.detail ? `: ${response.detail}` : "";
+        } catch {
+          // Keep the HTTP status when the response is not JSON.
+        }
+        reject(new Error(`Upload failed: ${xhr.status}${detail}`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(xhr.responseText) as { runId: string });
+      } catch {
+        reject(new Error("The API returned an invalid upload response."));
+      }
+    });
+    xhr.send(body);
+  });
+}
+
+export async function uploadEpisode(
+  file: File,
+  audience: Audience,
+  evidence: EvidencePackage = {},
+  onProgress?: (progress: UploadProgress) => void,
+): Promise<{ runId: string }> {
   const body = new FormData();
   body.append("episode", file);
   body.append("audience", audience);
   if (evidence.sceneDescriptions) body.append("scene_descriptions", evidence.sceneDescriptions);
   if (evidence.dialogueSubtitles) body.append("dialogue_subtitles", evidence.dialogueSubtitles);
   if (evidence.policiesMetadata) body.append("policies_metadata", evidence.policiesMetadata);
-  const response = await fetch(`${API_URL}/runs`, { method: "POST", body });
-  if (!response.ok) throw new Error(`Upload failed: ${response.status}`);
-  return response.json() as Promise<{ runId: string }>;
+  const result = await uploadEpisodeFile(body, onProgress);
+  await waitForRun(result.runId, onProgress);
+  return result;
+}
+
+export function retryStoryMap(runId: string): Promise<{ runId: string }> {
+  const body = new FormData();
+  body.append("model", "");
+  return request<{ runId: string }>(`/runs/${runId}/story-map/retry`, {
+    method: "POST",
+    body,
+  });
 }
 
 export function getStoryMap(runId: string): Promise<StoryMap> {

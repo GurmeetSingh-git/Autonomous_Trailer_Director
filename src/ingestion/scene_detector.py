@@ -1,11 +1,24 @@
 """Detect visual shot boundaries and reconcile them with LLM-proposed timecodes."""
 
-from scenedetect import detect, ContentDetector
+from scenedetect import ContentDetector, SceneManager, open_video
+
+
+FRAME_SKIP = 4
 
 
 def detect_scene_cuts(video_path: str, threshold: float = 30.0) -> list[dict]:
-    """Return exact visual shot boundaries from local frame-diff analysis."""
-    scene_list = detect(video_path, ContentDetector(threshold=threshold))
+    """Return shot boundaries using sampled frames to keep long-video analysis practical."""
+    video = open_video(video_path)
+    try:
+        manager = SceneManager()
+        manager.add_detector(ContentDetector(threshold=threshold))
+        manager.detect_scenes(video=video, frame_skip=FRAME_SKIP)
+        scene_list = manager.get_scene_list()
+    finally:
+        capture = getattr(video, "_cap", None)
+        if capture is not None:
+            capture.release()
+
     cuts = []
     for index, scene in enumerate(scene_list):
         start_seconds = scene[0].get_seconds()

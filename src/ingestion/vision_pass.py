@@ -10,13 +10,18 @@ frame timestamps — never reprocessing the episode.
 from __future__ import annotations
 
 import logging
+import math
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Callable
+
+import cv2
+import numpy as np
 
 from src.llm.client import LLMClient
-from src.models.shot import ShotRecord, ShotVisual
+from src.models.shot import ShotRecord, ShotVisual, ShotVisualBatch
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +32,13 @@ is provided as context. Fill in only what is visually confirmable from
 these frames: who appears, notable appearance details, actions taking
 place, the location, and visible objects. Do not repeat information that
 is already fully covered by the audio context. Do not guess at anything
-outside these frames.
+outside these frames. Also set is_credit_or_title to true when this is an
+opening/closing credit, cast/crew/producer name overlay, production logo,
+rating certificate, opening title, or title card that replaces story footage.
+Do not flag incidental text that is part of the story, such as posters,
+election materials, banners, signs, or writing on props. If people are
+performing a story action in a real location, treat it as story footage even
+when text is visible in the frame.
 """
 
 
@@ -52,7 +63,12 @@ def _probe_media_duration(video_path: str) -> float | None:
 
 
 def extract_frames(
-    video_path: str, start: float, end: float, output_dir: Path, count: int = 3
+    video_path: str,
+    start: float,
+    end: float,
+    output_dir: Path,
+    count: int = 3,
+    timestamps: list[float] | None = None,
 ) -> list[Path]:
     """Pull `count` evenly spaced frames from [start, end] with ffmpeg."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -65,13 +81,18 @@ def extract_frames(
         start = max(start, 0.0)
         end = max(end, start)
     duration = max(end - start, 0.01)
-    timestamps = (
+    sample_times = timestamps or (
         [start]
         if count == 1
         else [start + duration * (i / (count - 1)) for i in range(count)]
     )
+    sample_times = [
+        min(max(timestamp, 0.0), last_seek) if media_duration is not None
+        else max(timestamp, 0.0)
+        for timestamp in sample_times
+    ]
     frame_paths: list[Path] = []
-    for index, timestamp in enumerate(timestamps):
+    for index, timestamp in enumerate(sample_times):
         frame_path = output_dir / f"frame_{index}.jpg"
         cmd = [
             "ffmpeg", "-y", "-ss", str(timestamp), "-i", video_path,
@@ -136,31 +157,25 @@ def analyze_shot_visual(
     return updated
 
 
-def group_shots_for_vision(shots: list[ShotRecord]) -> list[list[ShotRecord]]:
-    """Group consecutive SILENT flagged shots into one unit for a shared
-    vision call, while keeping every other shot (including flagged shots
-    that have their own dialogue) as its own singleton group.
-
-    A shot only joins a group if visual_needed is True AND it has no
-    dialogue of its own — a shot with dialogue has its own audio context
-    and shouldn't be blended into a neighboring silent run, even if both
-    happen to be flagged. Groups are always contiguous in the original
-    shot order; nothing here reorders or drops a shot.
-    """
+def group_shots_for_vision(
+    shots: list[ShotRecord],
+    max_group_shots: int = 12,
+    max_group_duration: float = 45.0,
+) -> list[list[ShotRecord]]:
+    """Batch nearby shots needing visual evidence into bounded model calls."""
     groups: list[list[ShotRecord]] = []
     current_run: list[ShotRecord] = []
 
-    def _is_silent_and_needed(shot: ShotRecord) -> bool:
-        return shot.visual_needed and not shot.audio.dialogue.strip()
-
     for shot in shots:
-        if _is_silent_and_needed(shot):
-            current_run.append(shot)
+        if not shot.visual_needed:
             continue
-        if current_run:
+        if current_run and (
+            len(current_run) >= max_group_shots
+            or shot.end - current_run[0].start > max_group_duration
+        ):
             groups.append(current_run)
             current_run = []
-        groups.append([shot])
+        current_run.append(shot)
 
     if current_run:
         groups.append(current_run)
@@ -168,55 +183,103 @@ def group_shots_for_vision(shots: list[ShotRecord]) -> list[list[ShotRecord]]:
     return groups
 
 
+def _build_contact_sheet(
+    frame_paths: list[Path], shots: list[ShotRecord], output_path: Path
+) -> Path:
+    if len(frame_paths) != len(shots):
+        raise ValueError("Visual contact sheet requires exactly one frame per shot.")
+    columns = 3
+    tile_width, tile_height = 640, 360
+    rows = math.ceil(len(frame_paths) / columns)
+    sheet = np.zeros((rows * tile_height, columns * tile_width, 3), dtype=np.uint8)
+
+    for index, (frame_path, shot) in enumerate(zip(frame_paths, shots)):
+        frame = cv2.imread(str(frame_path))
+        if frame is None:
+            raise RuntimeError(f"Could not read extracted frame for {shot.shot_id}.")
+        frame = cv2.resize(frame, (tile_width, tile_height), interpolation=cv2.INTER_AREA)
+        label = f"{shot.shot_id}  {shot.start:.1f}-{shot.end:.1f}s"
+        cv2.rectangle(frame, (0, 0), (tile_width, 34), (0, 0, 0), thickness=-1)
+        cv2.putText(frame, label, (10, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+        row, column = divmod(index, columns)
+        y, x = row * tile_height, column * tile_width
+        sheet[y:y + tile_height, x:x + tile_width] = frame
+
+    if not cv2.imwrite(str(output_path), sheet, [cv2.IMWRITE_JPEG_QUALITY, 88]):
+        raise RuntimeError("Could not write the visual-analysis contact sheet.")
+    return output_path
+
+
 def analyze_shot_group_visual(
     group: list[ShotRecord],
     video_path: str,
     llm: LLMClient,
-    frames_per_shot: int = 2,
-    max_frames: int = 8,
     model: str | None = None,
 ) -> list[ShotRecord]:
-    """Run ONE vision call spanning a run of consecutive silent shots, then
-    apply the same result to every shot in the group.
-
-    This trades per-shot precision for fewer, cheaper calls on stretches
-    that are genuinely silent and contiguous — the model sees the whole
-    span at once, which is often *more* informative for continuous action
-    (e.g. someone walking down a corridor across several quick cuts) than
-    isolating each cut individually.
-    """
+    """Analyze one labeled frame per shot in one request with shot-specific results."""
     if len(group) == 1:
         return [analyze_shot_visual(group[0], video_path, llm, model=model)]
 
     start = group[0].start
     end = group[-1].end
-    frame_count = min(max_frames, max(3, frames_per_shot * len(group)))
-
-    with tempfile.TemporaryDirectory(prefix=f"shots-{group[0].shot_id}-{group[-1].shot_id}-") as tmp:
-        frame_paths = extract_frames(video_path, start, end, Path(tmp), frame_count)
-        prompt = VISION_PROMPT.format(n=len(frame_paths), start=start, end=end) + (
-            f"\n\nThese frames span {len(group)} consecutive silent shots "
-            f"({group[0].shot_id} through {group[-1].shot_id}). Describe what "
-            "is happening across this whole span, not just a single instant."
+    with tempfile.TemporaryDirectory(
+        prefix=f"shots-{group[0].shot_id}-{group[-1].shot_id}-"
+    ) as temp_dir:
+        temp_path = Path(temp_dir)
+        frame_paths = extract_frames(
+            video_path,
+            start,
+            end,
+            temp_path,
+            timestamps=[(shot.start + shot.end) / 2 for shot in group],
+        )
+        contact_sheet = _build_contact_sheet(
+            frame_paths, group, temp_path / "contact-sheet.jpg"
         )
         try:
-            visual = llm.generate_structured(
-                system_prompt=prompt,
-                media=[str(path) for path in frame_paths],
-                context={"shot_ids": [shot.shot_id for shot in group]},
-                response_schema=ShotVisual,
-                cache_key=f"{group[0].shot_id}-{group[-1].shot_id}-visual-group",
+            batch = llm.generate_structured(
+                system_prompt=(
+                    "The attached contact sheet contains one frame per shot, ordered "
+                    "left-to-right and top-to-bottom. Each frame is labeled with its "
+                    "shot ID and source time. Return one visual description for every "
+                    "listed shot, using only what is visible in that shot's frame. Do "
+                    "not copy actions, locations, people, or objects from one shot to "
+                    "another. Classify opening/closing credits, cast/crew overlays, "
+                    "production logos, rating certificates, opening titles, and title "
+                    "cards. Each result must use the exact corresponding shot_id from "
+                    "the audio context."
+                ),
+                media=str(contact_sheet),
+                context={
+                    "shots": [
+                        {
+                            "shot_id": shot.shot_id,
+                            "start": shot.start,
+                            "end": shot.end,
+                            "audio": shot.audio.model_dump(),
+                        }
+                        for shot in group
+                    ]
+                },
+                response_schema=ShotVisualBatch,
+                cache_key=f"{group[0].shot_id}-{group[-1].shot_id}-visual-batch",
                 model=model,
             )
         except Exception:
             logger.exception(
-                "Grouped vision pass failed for shots %s-%s; leaving audio_only",
+                "Batched vision pass failed for shots %s-%s; leaving audio_only",
                 group[0].shot_id, group[-1].shot_id,
             )
             return group
 
-    updated_group = []
+    visual_by_id = {result.shot_id: result.visual for result in batch.shots}
+    updated_group: list[ShotRecord] = []
     for shot in group:
+        visual = visual_by_id.get(shot.shot_id)
+        if visual is None:
+            logger.warning("Batched vision response omitted shot %s", shot.shot_id)
+            updated_group.append(shot)
+            continue
         updated = shot.model_copy()
         updated.visual = visual
         updated.coverage = "frame_confirmed"
@@ -225,26 +288,34 @@ def analyze_shot_group_visual(
 
 
 def run_vision_pass(
-    shots: list[ShotRecord], video_path: str, llm: LLMClient, model: str | None = None
+    shots: list[ShotRecord],
+    video_path: str,
+    llm: LLMClient,
+    model: str | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[ShotRecord]:
-    """Run the vision pass on flagged shots, grouping consecutive silent
-    runs into a single call each. Shots that aren't flagged pass through
-    untouched; flagged shots with their own dialogue are still analyzed
-    individually.
-    """
+    """Run batched visual analysis, reporting completed and total visual shots."""
     groups = group_shots_for_vision(shots)
-    result: list[ShotRecord] = []
+    total_visual_shots = sum(shot.visual_needed for shot in shots)
+    visual_results: dict[str, ShotRecord] = {}
+    completed_visual_shots = 0
+    logger.info(
+        "Starting visual analysis for %d shots in %d model calls.",
+        total_visual_shots, len(groups),
+    )
+    if progress_callback:
+        progress_callback(completed_visual_shots, total_visual_shots)
+
     for group in groups:
         if len(group) == 1:
-            shot = group[0]
-            result.append(
-                analyze_shot_visual(shot, video_path, llm, model=model)
-                if shot.visual_needed
-                else shot
-            )
+            analyzed_group = [analyze_shot_visual(group[0], video_path, llm, model=model)]
         else:
-            result.extend(analyze_shot_group_visual(group, video_path, llm, model=model))
-    return result
+            analyzed_group = analyze_shot_group_visual(group, video_path, llm, model=model)
+        visual_results.update({shot.shot_id: shot for shot in analyzed_group})
+        completed_visual_shots += len(group)
+        if progress_callback:
+            progress_callback(completed_visual_shots, total_visual_shots)
+    return [visual_results.get(shot.shot_id, shot) for shot in shots]
 
 
 def recheck_shot(

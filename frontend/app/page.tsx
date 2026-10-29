@@ -1,10 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ArrowUpRight, FileVideo, Sparkles } from "lucide-react";
 import Link from "next/link";
 import { AudienceTabs } from "@/components/AudienceTabs";
-import { demoStoryMap, retryStoryMap, type Audience, type EvidencePackage, uploadEpisode } from "@/lib/api";
+import { demoStoryMap, retryStoryMap, type Audience, type EvidencePackage, type UploadProgress, uploadEpisode } from "@/lib/api";
 
 const evidenceDropzones = [
   { key: "sceneDescriptions", title: "Scene descriptions", detail: "JSON, TXT, or CSV", accept: ".json,.txt,.csv,application/json,text/plain,text/csv" },
@@ -17,32 +17,44 @@ export default function HomePage() {
   const [file, setFile] = useState<File | null>(null);
   const [evidence, setEvidence] = useState<EvidencePackage>({});
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState<UploadProgress | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [message, setMessage] = useState("");
   const [recoverableRunId, setRecoverableRunId] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (!loading || !progress) return;
+    const stageStartedAt = Date.now();
+    const interval = window.setInterval(
+      () => setElapsedSeconds(Math.floor((Date.now() - stageStartedAt) / 1000)),
+      1000,
+    );
+    return () => window.clearInterval(interval);
+  }, [loading, progress?.stage]);
+
   async function handleSubmit() {
     if (!file) { setMessage("Choose an episode package to begin."); return; }
-    setLoading(true); setMessage(""); setRecoverableRunId(null);
+    setLoading(true); setProgress({ stage: "uploading", message: "Uploading episode...", percentage: 0 }); setMessage(""); setRecoverableRunId(null);
     try {
-      const result = await uploadEpisode(file, audience, evidence);
+      const result = await uploadEpisode(file, audience, evidence, setProgress);
       window.location.href = `/story-map?run=${result.runId}`;
     } catch (requestError) {
       const errorMessage = requestError instanceof Error ? requestError.message : "Upload analysis failed.";
-      const runId = errorMessage.match(/\/runs\/([\da-f]+)\/story-map\/retry/i)?.[1] ?? null;
+      const runId = errorMessage.match(/\[recoverableRunId=([\da-f-]+)\]/i)?.[1] ?? null;
       setRecoverableRunId(runId);
-      setMessage(runId ? "The story map could not be generated, but the saved analysis can be retried." : "Upload analysis failed. Check that the API is running and the model is configured.");
-    } finally { setLoading(false); }
+      setMessage(runId ? `${errorMessage.replace(/\s*\[recoverableRunId=[\da-f-]+\]/i, "")} Saved analysis can be retried.` : errorMessage);
+    } finally { setLoading(false); setProgress(null); }
   }
 
   async function handleRetry() {
     if (!recoverableRunId) return;
-    setLoading(true); setMessage("");
+    setLoading(true); setProgress({ stage: "retrying", message: "Retrying saved analysis..." }); setMessage("");
     try {
       await retryStoryMap(recoverableRunId);
       window.location.href = `/story-map?run=${recoverableRunId}`;
     } catch (requestError) {
       setMessage(requestError instanceof Error ? requestError.message : "The saved analysis could not be recovered.");
-    } finally { setLoading(false); }
+    } finally { setLoading(false); setProgress(null); }
   }
 
   return (
@@ -74,7 +86,25 @@ export default function HomePage() {
             </div>
             <div className="upload-label">Audience lens</div>
             <AudienceTabs value={audience} onChange={setAudience} />
-            <button className="primary-button" onClick={handleSubmit} disabled={loading}>{loading ? "Reading episode..." : "Build the story map ->"}</button>
+            <button className="primary-button" onClick={handleSubmit} disabled={loading}>{loading ? "Analysis in progress..." : "Build the story map ->"}</button>
+            {loading && progress && <section className="analysis-progress" aria-live="polite">
+              <div className="analysis-progress-heading"><span className="analysis-spinner" aria-hidden="true" /><strong>{progress.message}</strong></div>
+              <div
+                className="analysis-progress-track"
+                role="progressbar"
+                aria-label={progress.message}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={progress.percentage}
+              >
+                <span className={progress.percentage === undefined ? "analysis-progress-indeterminate" : ""} style={progress.percentage === undefined ? undefined : { width: `${progress.percentage}%` }} />
+              </div>
+              <div className="analysis-progress-footer">
+                <span>{progress.percentage === undefined ? "Processing can take several minutes for a full episode." : `${progress.percentage}% uploaded`}</span>
+                <span>{Math.floor(elapsedSeconds / 60)}:{String(elapsedSeconds % 60).padStart(2, "0")} elapsed</span>
+              </div>
+              {progress.stage === "detecting_scenes" && <p className="analysis-progress-note">PySceneDetect is installed and scanning video frames. The page will move to transcription when the scan finishes.</p>}
+            </section>}
             {message && <p style={{ color: "#f7cfbf", fontSize: 12 }}>{message}</p>}
             {recoverableRunId && <button className="mono" onClick={handleRetry} disabled={loading}>{loading ? "Retrying saved analysis..." : "Retry saved analysis"}</button>}
           </div>

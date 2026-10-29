@@ -28,6 +28,16 @@ class ShotVisual(BaseModel):
     actions: list[str] = Field(default_factory=list)
     location: list[str] = Field(default_factory=list)
     objects: list[str] = Field(default_factory=list)
+    is_credit_or_title: bool = False
+
+
+class ShotVisualResult(BaseModel):
+    shot_id: str
+    visual: ShotVisual
+
+
+class ShotVisualBatch(BaseModel):
+    shots: list[ShotVisualResult] = Field(default_factory=list)
 
 
 class ShotRecord(BaseModel):
